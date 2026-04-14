@@ -1,0 +1,13 @@
+{
+  "schema_type": "order_created",
+  "version": "1.0",
+  "fields": {
+    "order_id": {"type": "uuid", "required": true},
+    "user_id": {"type": "uuid", "required": true},
+    "kitchen_id": {"type": "uuid", "required": true},
+    "items": {"type": "array", "required": true},
+    "total_amount": {"type": "float", "required": false},
+    "payment_method": {"type": "string", "required": true},
+    "timestamp": {"type": "float", "required": true}
+  }
+}

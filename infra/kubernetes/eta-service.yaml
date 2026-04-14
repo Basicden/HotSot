@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eta-service
+  labels:
+    app: eta-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: eta-service
+  template:
+    metadata:
+      labels:
+        app: eta-service
+    spec:
+      containers:
+      - name: eta-service
+        image: hotsot/eta-service:latest
+        ports:
+        - containerPort: 8004
+        envFrom:
+        - configMapRef:
+            name: hotsot-config
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8004
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8004
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eta-service
+spec:
+  type: ClusterIP
+  selector:
+    app: eta-service
+  ports:
+  - port: 8004
+    targetPort: 8004

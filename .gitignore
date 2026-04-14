@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.production
+
+# ML artifacts
+*.pkl
+*.joblib
+*.h5
+models/*.txt
+ml/models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Build artifacts
+*.pdf
+build_status_report.py

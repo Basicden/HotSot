@@ -1,0 +1,110 @@
+# HotSot Kafka Topics — Event Backbone
+# All state changes flow through these topics
+
+topics:
+  # Order lifecycle
+  - name: orders.created
+    partitions: 6
+    replication_factor: 3
+    description: "New order creation events"
+
+  - name: orders.payment_confirmed
+    partitions: 6
+    replication_factor: 3
+    description: "Payment confirmation events"
+
+  - name: orders.slot_reserved
+    partitions: 3
+    replication_factor: 3
+    description: "Slot reservation events"
+
+  - name: orders.cancelled
+    partitions: 3
+    replication_factor: 3
+    description: "Order cancellation events"
+
+  # Kitchen events
+  - name: kitchen.prep_started
+    partitions: 6
+    replication_factor: 3
+    description: "Kitchen prep start events"
+
+  - name: kitchen.ready
+    partitions: 6
+    replication_factor: 3
+    description: "Kitchen ready events"
+
+  - name: kitchen.overload
+    partitions: 3
+    replication_factor: 3
+    description: "Kitchen overload alerts"
+
+  - name: kitchen.throughput_update
+    partitions: 3
+    replication_factor: 3
+    description: "Kitchen throughput metric updates"
+
+  # ETA events
+  - name: eta.updated
+    partitions: 6
+    replication_factor: 3
+    description: "ETA prediction updates"
+
+  - name: eta.recalculated
+    partitions: 3
+    replication_factor: 3
+    description: "ETA recalculation events"
+
+  # Shelf events
+  - name: shelf.assigned
+    partitions: 6
+    replication_factor: 3
+    description: "Shelf assignment events"
+
+  - name: shelf.expiry_warning
+    partitions: 3
+    replication_factor: 3
+    description: "Shelf TTL expiry warnings"
+
+  # Pickup events
+  - name: order.picked
+    partitions: 6
+    replication_factor: 3
+    description: "Order pickup completion events"
+
+  # Arrival detection
+  - name: arrival.detected
+    partitions: 3
+    replication_factor: 3
+    description: "User arrival detection events"
+
+  # Notifications
+  - name: notification.send
+    partitions: 3
+    replication_factor: 3
+    description: "Notification dispatch events"
+
+  # Incident
+  - name: incident.delay_detected
+    partitions: 3
+    replication_factor: 3
+    description: "Delay detection incidents"
+
+consumer_groups:
+  - name: order-service-group
+    topics: [orders.created, orders.payment_confirmed, orders.cancelled]
+
+  - name: kitchen-service-group
+    topics: [orders.payment_confirmed, kitchen.prep_started, kitchen.ready]
+
+  - name: eta-service-group
+    topics: [orders.created, kitchen.throughput_update, eta.recalculated]
+
+  - name: shelf-service-group
+    topics: [kitchen.ready, shelf.assigned, shelf.expiry_warning]
+
+  - name: notification-service-group
+    topics: [orders.created, kitchen.ready, shelf.assigned, order.picked, incident.delay_detected]
+
+  - name: realtime-service-group
+    topics: [eta.updated, kitchen.prep_started, shelf.assigned, order.picked, arrival.detected]

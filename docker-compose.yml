@@ -1,0 +1,215 @@
+version: "3.9"
+
+services:
+  # ─── INFRASTRUCTURE ───
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hotsot
+      POSTGRES_USER: hotsot
+      POSTGRES_PASSWORD: hotsot_dev_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hotsot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  # ─── SERVICES ───
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      ORDER_SERVICE_URL: http://order-service:8001
+      KITCHEN_SERVICE_URL: http://kitchen-service:8002
+      SHELF_SERVICE_URL: http://shelf-service:8003
+      ETA_SERVICE_URL: http://eta-service:8004
+      NOTIFICATION_SERVICE_URL: http://notification-service:8005
+      ARRIVAL_SERVICE_URL: http://arrival-service:8008
+      COMPENSATION_SERVICE_URL: http://compensation-service:8010
+    depends_on:
+      - order-service
+      - kitchen-service
+      - shelf-service
+      - arrival-service
+      - compensation-service
+
+  order-service:
+    build:
+      context: ./services/order-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP: kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  kitchen-service:
+    build:
+      context: ./services/kitchen-service
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
+      REDIS_URL: redis://redis:6379/1
+      KAFKA_BOOTSTRAP: kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  shelf-service:
+    build:
+      context: ./services/shelf-service
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
+      REDIS_URL: redis://redis:6379/2
+      KAFKA_BOOTSTRAP: kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  eta-service:
+    build:
+      context: ./services/eta-service
+      dockerfile: Dockerfile
+    ports:
+      - "8004:8004"
+    environment:
+      REDIS_URL: redis://redis:6379/3
+      KAFKA_BOOTSTRAP: kafka:29092
+      MODEL_PATH: /app/models/eta_model.txt
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      SMS_PROVIDER: mock
+
+  realtime-service:
+    build:
+      context: ./services/realtime-service
+      dockerfile: Dockerfile
+    ports:
+      - "8006:8006"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379/4
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ml-service:
+    build:
+      context: ./services/ml-service
+      dockerfile: Dockerfile
+    ports:
+      - "8007:8007"
+    environment:
+      REDIS_URL: redis://redis:6379/5
+      S3_BUCKET: hotsot-ml-data
+      MODEL_REGISTRY: /app/models
+    volumes:
+      - ./ml:/app/ml-src
+
+  arrival-service:
+    build:
+      context: ./services/arrival-service
+      dockerfile: Dockerfile
+    ports:
+      - "8008:8008"
+    environment:
+      REDIS_URL: redis://redis:6379/6
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ARRIVAL_RADIUS_M: 150
+      QR_TOKEN_ROTATION_S: 30
+      DEDUP_WINDOW_S: 30
+      PRIORITY_BOOST_AMOUNT: 20
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  compensation-service:
+    build:
+      context: ./services/compensation-service
+      dockerfile: Dockerfile
+    ports:
+      - "8010:8010"
+    environment:
+      REDIS_URL: redis://redis:6379/7
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DELAY_THRESHOLD_MINUTES: 15
+      CREDIT_NOTE_MIN_AMOUNT: 50.0
+      CREDIT_NOTE_MAX_AMOUNT: 100.0
+      SHELF_EXPIRATION_PENALTY_THRESHOLD: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+volumes:
+  pgdata:

@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  labels:
+    app: api-gateway
+    tier: frontend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+      - name: api-gateway
+        image: hotsot/api-gateway:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: ORDER_SERVICE_URL
+          value: "http://order-service:8001"
+        - name: KITCHEN_SERVICE_URL
+          value: "http://kitchen-service:8002"
+        - name: SHELF_SERVICE_URL
+          value: "http://shelf-service:8003"
+        - name: ETA_SERVICE_URL
+          value: "http://eta-service:8004"
+        - name: NOTIFICATION_SERVICE_URL
+          value: "http://notification-service:8005"
+        - name: REALTIME_SERVICE_URL
+          value: "http://realtime-service:8006"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+spec:
+  selector:
+    app: api-gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: LoadBalancer

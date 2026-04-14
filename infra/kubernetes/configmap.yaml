@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hotsot-config
+data:
+  ORDER_SERVICE_URL: "http://order-service:8001"
+  KITCHEN_SERVICE_URL: "http://kitchen-service:8002"
+  SHELF_SERVICE_URL: "http://shelf-service:8003"
+  ETA_SERVICE_URL: "http://eta-service:8004"
+  NOTIFICATION_SERVICE_URL: "http://notification-service:8005"
+  REALTIME_SERVICE_URL: "http://realtime-service:8006"
+  ML_SERVICE_URL: "http://ml-service:8007"
+  ARRIVAL_SERVICE_URL: "http://arrival-service:8008"
+  COMPENSATION_SERVICE_URL: "http://compensation-service:8010"
+  REDIS_URL: "redis://redis:6379/0"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+  DATABASE_URL: "postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot"
+  kafka-bootstrap: "kafka-cluster:9092"
+  redis-url: "redis://redis-cluster:6379"
+  log-level: "INFO"
+  environment: "production"
+  region: "ap-south-1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hotsot-secrets
+type: Opaque
+stringData:
+  database-url: "postgresql+asyncpg://hotsot:CHANGE_ME@rds-endpoint.ap-south-1.rds.amazonaws.com:5432/hotsot"
+  redis-url: "redis://:CHANGE_ME@redis-cluster.ap-south-1.001.cache.amazonaws.com:6379/0"
+  auth-secret: "CHANGE_ME_IN_PRODUCTION"

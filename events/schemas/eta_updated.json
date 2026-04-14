@@ -1,0 +1,13 @@
+{
+  "schema_type": "eta_updated",
+  "version": "1.0",
+  "fields": {
+    "order_id": {"type": "uuid", "required": true},
+    "eta_seconds": {"type": "integer", "required": true},
+    "confidence": {"type": "float", "required": true},
+    "confidence_interval": {"type": "array", "required": true},
+    "risk_level": {"type": "string", "required": true},
+    "model_version": {"type": "string", "required": true},
+    "timestamp": {"type": "float", "required": true}
+  }
+}

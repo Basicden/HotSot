@@ -1,0 +1,12 @@
+{
+  "schema_type": "shelf_assigned",
+  "version": "1.0",
+  "fields": {
+    "order_id": {"type": "uuid", "required": true},
+    "shelf_id": {"type": "string", "required": true},
+    "kitchen_id": {"type": "uuid", "required": true},
+    "zone": {"type": "string", "required": true},
+    "ttl_seconds": {"type": "integer", "required": true},
+    "timestamp": {"type": "float", "required": true}
+  }
+}
