@@ -1,4 +1,8 @@
-"""HotSot Shelf Service — Shelf Routes."""
+"""HotSot Shelf Service — Shelf Routes.
+
+V2: Emits shelf Kafka events (assigned, released, expired) on every
+shelf lifecycle change so downstream services can react in real-time.
+"""
 
 import time
 from typing import Optional
@@ -7,6 +11,7 @@ from pydantic import BaseModel
 
 from app.core.redis_client import acquire_shelf_lock, release_shelf_lock, get_shelf_status, set_shelf_status, get_shelf_ttl
 from app.core.ttl_engine import ttl_engine
+from app.main import emit_shelf_event
 
 router = APIRouter()
 
@@ -43,6 +48,16 @@ async def assign_shelf(req: ShelfAssignRequest):
         "ttl_seconds": ttl_engine.shelves[shelf_id].ttl_seconds,
     })
 
+    # Emit shelf.assigned Kafka event
+    emit_shelf_event("assigned", {
+        "shelf_id": shelf_id,
+        "order_id": req.order_id,
+        "kitchen_id": req.kitchen_id,
+        "zone": ttl_engine.shelves[shelf_id].temperature_zone,
+        "ttl_seconds": ttl_engine.shelves[shelf_id].ttl_seconds,
+        "assigned_at": time.time(),
+    })
+
     return {
         "shelf_id": shelf_id, "order_id": req.order_id,
         "zone": ttl_engine.shelves[shelf_id].temperature_zone,
@@ -60,6 +75,14 @@ async def release_shelf(shelf_id: str, req: ShelfReleaseRequest):
     if not order_id:
         raise HTTPException(status_code=404, detail="Shelf not found or already available")
     await set_shelf_status(shelf_id, {"status": "AVAILABLE", "order_id": None})
+
+    # Emit shelf.released Kafka event
+    emit_shelf_event("released", {
+        "shelf_id": shelf_id,
+        "order_id": req.order_id,
+        "released_at": time.time(),
+    })
+
     return {"shelf_id": shelf_id, "order_id": order_id, "status": "AVAILABLE"}
 
 
@@ -80,6 +103,16 @@ async def get_expiry_warnings(kitchen_id: str):
     """Get shelf TTL expiry warnings for a kitchen."""
     warnings = ttl_engine.check_expiry_warnings(kitchen_id)
     expired = ttl_engine.process_expired(kitchen_id)
+
+    # Emit shelf.expired Kafka events for each expired order
+    for exp in expired:
+        emit_shelf_event("expired", {
+            "shelf_id": exp["shelf_id"],
+            "order_id": exp["order_id"],
+            "kitchen_id": kitchen_id,
+            "ttl_exceeded_by": exp["ttl_exceeded_by"],
+        })
+
     return {"warnings": warnings, "expired": expired, "total_warnings": len(warnings), "total_expired": len(expired)}
 
 
