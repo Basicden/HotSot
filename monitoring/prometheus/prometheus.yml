@@ -1,0 +1,73 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ─── HotSot Microservices ──────────────────────────────
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['order-service:8001']
+    metrics_path: /metrics
+
+  - job_name: 'kitchen-service'
+    static_configs:
+      - targets: ['kitchen-service:8002']
+    metrics_path: /metrics
+
+  - job_name: 'shelf-service'
+    static_configs:
+      - targets: ['shelf-service:8003']
+    metrics_path: /metrics
+
+  - job_name: 'eta-service'
+    static_configs:
+      - targets: ['eta-service:8004']
+    metrics_path: /metrics
+
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:8005']
+    metrics_path: /metrics
+
+  - job_name: 'realtime-service'
+    static_configs:
+      - targets: ['realtime-service:8006']
+    metrics_path: /metrics
+
+  - job_name: 'ml-service'
+    static_configs:
+      - targets: ['ml-service:8007']
+    metrics_path: /metrics
+
+  - job_name: 'arrival-service'
+    static_configs:
+      - targets: ['arrival-service:8008']
+    metrics_path: /metrics
+
+  - job_name: 'compensation-service'
+    static_configs:
+      - targets: ['compensation-service:8010']
+    metrics_path: /metrics
+
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:8000']
+    metrics_path: /metrics
+
+  # ─── Infrastructure ────────────────────────────────────
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  # ─── Prometheus itself ─────────────────────────────────
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
