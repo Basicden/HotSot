@@ -1,490 +1,242 @@
-"""
-HotSot Arrival Service — Arrival API Routes
-============================================
-All HTTP endpoints for user arrival detection, status, QR tokens,
-and kitchen waiting lists.
-"""
+"""HotSot Arrival Service — Arrival Detection Routes."""
 
-from __future__ import annotations
-
-import hashlib
-import hmac
-import logging
-import time
 import uuid
+import hashlib
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from app.core.config import get_settings
-from app.core.dedup import ActiveArrival, ArrivalDedupEngine
-from app.core.geo import (
-    ArrivalStrength,
-    ArrivalType,
-    GPSCoordinate,
-    validate_gps_arrival,
-    validate_qr_arrival,
-)
+from shared.auth.jwt import get_current_user
+from shared.utils.helpers import now_iso, generate_id
+from shared.types.schemas import EventType
 
-logger = logging.getLogger(__name__)
+from app.core.database import ArrivalEventModel
+from app.core.geo import haversine_distance, is_within_geofence, classify_proximity
+from app.core.dedup import ArrivalDeduplicator
 
-router = APIRouter(prefix="/arrival", tags=["arrival"])
-
-
-# ── Pydantic Schemas ───────────────────────────────────────────────────
-
-class ArrivalDetectRequest(BaseModel):
-    """Request body for POST /arrival/detect."""
-    user_id: str = Field(..., min_length=1, description="User ID")
-    order_id: str = Field(..., min_length=1, description="Order ID")
-    kitchen_id: str = Field(..., min_length=1, description="Kitchen / pickup location ID")
-    idempotency_key: str = Field(..., min_length=1, description="Client-supplied idempotency key")
-    # GPS fields (required when method=gps)
-    user_lat: Optional[float] = Field(None, ge=-90, le=90, description="User latitude")
-    user_lon: Optional[float] = Field(None, ge=-180, le=180, description="User longitude")
-    kitchen_lat: Optional[float] = Field(None, ge=-90, le=90, description="Kitchen latitude")
-    kitchen_lon: Optional[float] = Field(None, ge=-180, le=180, description="Kitchen longitude")
-    # QR fields
-    qr_token: Optional[str] = Field(None, description="Scanned QR token")
-    # Detection method
-    method: str = Field(..., pattern="^(gps|qr)$", description="Detection method: gps or qr")
+router = APIRouter()
+_session_factory = None
+_redis_client = None
+_kafka_producer = None
 
 
-class ArrivalDetectResponse(BaseModel):
-    """Response for POST /arrival/detect."""
-    arrival_id: str
-    order_id: str
-    user_id: str
-    kitchen_id: str
-    is_arrived: bool
-    strength: str          # "hard" | "soft"
-    arrival_type: str      # "gps" | "qr"
-    distance_m: Optional[float] = None
-    threshold_m: Optional[float] = None
-    priority_boosted: bool
-    message: str
-    detected_at: str
+def set_dependencies(session_factory, redis_client, kafka_producer):
+    global _session_factory, _redis_client, _kafka_producer
+    _session_factory = session_factory
+    _redis_client = redis_client
+    _kafka_producer = kafka_producer
 
 
-class ArrivalStatusResponse(BaseModel):
-    """Response for GET /arrival/{order_id}/status."""
-    order_id: str
-    has_active_arrival: bool
-    arrival: Optional[dict] = None
+async def get_session():
+    if _session_factory is None:
+        raise RuntimeError("Session factory not initialized")
+    async with _session_factory() as session:
+        yield session
 
 
-class QRTokenResponse(BaseModel):
-    """Response for POST /arrival/{order_id}/qr-token."""
-    order_id: str
-    token: str
-    expires_at: str
-    rotation_s: int
-
-
-class WaitingUserResponse(BaseModel):
-    """Single waiting user entry."""
-    order_id: str
-    user_id: str
-    kitchen_id: str
-    detected_at: str
-    strength: str
-    arrival_type: str
-
-
-class WaitingListResponse(BaseModel):
-    """Response for GET /arrival/kitchen/{kitchen_id}/waiting."""
-    kitchen_id: str
-    count: int
-    waiting: list[WaitingUserResponse]
-
-
-# ── Dependencies ───────────────────────────────────────────────────────
-
-def get_dedup_engine() -> ArrivalDedupEngine:
-    return ArrivalDedupEngine()
-
-
-# ── Kafka helpers (lightweight producer) ───────────────────────────────
-
-async def _emit_kafka_event(topic: str, event: dict) -> None:
-    """
-    Fire-and-forget Kafka event emission.
-
-    In production this would use a pooled producer; here we keep it
-    simple with a per-call producer that is closed after sending.
-    """
-    try:
-        from kafka import KafkaProducer
-        import json
-
-        settings = get_settings()
-        producer = KafkaProducer(
-            bootstrap_servers=settings.kafka_bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            linger_ms=0,
-        )
-        producer.send(topic, event)
-        producer.flush(timeout=5)
-        producer.close(timeout=5)
-        logger.info("Kafka event sent to %s: %s", topic, event.get("event_type"))
-    except Exception:
-        # Kafka failures must NOT block the arrival flow
-        logger.exception("Failed to emit Kafka event to %s", topic)
-
-
-# ── QR token generation ────────────────────────────────────────────────
-
-def _generate_qr_token(order_id: str, kitchen_id: str) -> tuple[str, str]:
-    """
-    Generate a time-bounded QR token using HMAC-SHA256.
-
-    The token is valid for the current rotation window.  A fresh token
-    is produced each call; the same inputs within the same window will
-    produce the same token (idempotent at the window level).
-
-    Returns
-    -------
-    (token, expires_at_iso)
-    """
-    settings = get_settings()
-    rotation = settings.qr_token_rotation_s
-    now = time.time()
-    bucket = int(now // rotation)
-    expires_at = (bucket + 1) * rotation
-
-    payload = f"{order_id}:{kitchen_id}:{bucket}"
-    sig = hmac.new(
-        settings.qr_token_secret.encode(),
-        payload.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
-    token = f"{order_id}.{bucket}.{sig}"
-    expires_at_iso = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
-    return token, expires_at_iso
-
-
-def _verify_qr_token(token: str, order_id: str, kitchen_id: str) -> bool:
-    """Verify a QR token against the current (and previous) window."""
-    settings = get_settings()
-    rotation = settings.qr_token_rotation_s
-    now = time.time()
-
-    for offset in (0, -1):  # current and previous window
-        bucket = int(now // rotation) + offset
-        payload = f"{order_id}:{kitchen_id}:{bucket}"
-        sig = hmac.new(
-            settings.qr_token_secret.encode(),
-            payload.encode(),
-            hashlib.sha256,
-        ).hexdigest()
-        expected = f"{order_id}.{bucket}.{sig}"
-        if hmac.compare_digest(token, expected):
-            return True
-    return False
-
-
-# ── Idempotency ────────────────────────────────────────────────────────
-
-async def _check_idempotency(key: str) -> Optional[dict]:
-    """Check if we've already processed a request with this idempotency key."""
-    from app.core.dedup import ArrivalDedupEngine
-    engine = ArrivalDedupEngine()
-    r = await engine._get_redis()
-    cached = await r.get(f"hotsot:arrival:idempotency:{key}")
-    if cached:
-        import json
-        return json.loads(cached)
-    return None
-
-
-async def _store_idempotency(key: str, response: dict) -> None:
-    """Cache a successful response under the idempotency key."""
-    from app.core.dedup import ArrivalDedupEngine
-    engine = ArrivalDedupEngine()
-    r = await engine._get_redis()
-    import json
-    await r.set(
-        f"hotsot:arrival:idempotency:{key}",
-        json.dumps(response),
-        ex=300,  # 5 minute TTL
-    )
-
-
-# ── Endpoints ──────────────────────────────────────────────────────────
-
-@router.post(
-    "/detect",
-    response_model=ArrivalDetectResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Detect user arrival",
-    description=(
-        "Detect whether a user has arrived at the pickup location "
-        "via GPS coordinates or QR scan. Hard arrivals (within radius "
-        "or QR-verified) trigger a priority boost; soft arrivals are "
-        "logged only."
-    ),
-)
+@router.post("/detect")
 async def detect_arrival(
-    body: ArrivalDetectRequest,
-    dedup: ArrivalDedupEngine = Depends(get_dedup_engine),
-) -> ArrivalDetectResponse:
-    settings = get_settings()
+    order_id: str,
+    user_id: str,
+    kitchen_id: str,
+    kitchen_lat: float,
+    kitchen_lng: float,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    qr_scan: bool = False,
+    idempotency_key: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Detect user arrival via GPS coordinates or QR scan.
 
-    # ── 1. Idempotency check ───────────────────────────────────────
-    cached = await _check_idempotency(body.idempotency_key)
-    if cached:
-        logger.info("Idempotent replay for key=%s", body.idempotency_key)
-        return ArrivalDetectResponse(**cached)
+    Validation:
+    - GPS: user must be within 150m of kitchen
+    - QR Scan: always valid (user physically scanned)
+    """
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-    # ── 2. Dedup check ─────────────────────────────────────────────
-    dedup_result = await dedup.check_and_record(
-        user_id=body.user_id,
-        order_id=body.order_id,
-    )
-    if dedup_result.is_duplicate:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Duplicate arrival event within dedup window",
-        )
+    # Deduplication
+    dedup = ArrivalDeduplicator(_redis_client)
+    if await dedup.is_duplicate(user_id, order_id, time.time(), tenant_id):
+        return {"order_id": order_id, "status": "duplicate", "message": "Already processed"}
 
-    # ── 3. Validate arrival ────────────────────────────────────────
-    priority_boosted = False
-    message = ""
+    # Check idempotency key
+    if idempotency_key:
+        cached = await dedup.check_idempotency_key(idempotency_key, tenant_id)
+        if cached:
+            return {"order_id": order_id, "status": "cached", "cached_response": cached}
 
-    if body.method == "gps":
-        if body.user_lat is None or body.user_lon is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="GPS method requires user_lat and user_lon",
-            )
-        if body.kitchen_lat is None or body.kitchen_lon is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="GPS method requires kitchen_lat and kitchen_lon",
-            )
+    # Calculate distance
+    distance_meters = None
+    is_valid = False
 
-        user_coord = GPSCoordinate(latitude=body.user_lat, longitude=body.user_lon)
-        kitchen_coord = GPSCoordinate(latitude=body.kitchen_lat, longitude=body.kitchen_lon)
-        verdict = validate_gps_arrival(user_coord, kitchen_coord)
-
-        if verdict.is_arrived:
-            priority_boosted = True
-            message = f"Hard GPS arrival — {verdict.distance_m}m away (≤{verdict.threshold_m}m)"
-        else:
-            message = f"Soft GPS arrival — {verdict.distance_m}m away (>{verdict.threshold_m}m threshold)"
-
-    elif body.method == "qr":
-        if body.qr_token is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="QR method requires qr_token",
-            )
-        if body.kitchen_lat is None or body.kitchen_lon is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="QR method requires kitchen_lat and kitchen_lon for tracking",
-            )
-
-        kitchen_coord = GPSCoordinate(latitude=body.kitchen_lat, longitude=body.kitchen_lon)
-
-        if not _verify_qr_token(body.qr_token, body.order_id, body.kitchen_id):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired QR token",
-            )
-
-        verdict = validate_qr_arrival(kitchen_coord)
-        priority_boosted = True
-        message = "Hard QR arrival — token verified"
+    if qr_scan:
+        # QR scan is always valid — user is physically at the kitchen
+        is_valid = True
+        distance_meters = 0
+        signal_type = "QR_SCAN"
+    elif latitude is not None and longitude is not None:
+        # GPS-based detection
+        distance_meters = haversine_distance(latitude, longitude, kitchen_lat, kitchen_lng)
+        is_valid = is_within_geofence(latitude, longitude, kitchen_lat, kitchen_lng, 150)
+        signal_type = "GPS"
     else:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unsupported method: {body.method}",
+        raise HTTPException(status_code=400, detail="Provide GPS coordinates or qr_scan=true")
+
+    if not is_valid:
+        return {
+            "order_id": order_id,
+            "is_valid": False,
+            "distance_meters": round(distance_meters, 1) if distance_meters else None,
+            "message": "User not within geofence (150m radius)",
+        }
+
+    # Generate idempotency key if not provided
+    if not idempotency_key:
+        ts_bucket = int(time.time()) // 30
+        raw = f"{user_id}:{order_id}:{ts_bucket}"
+        idempotency_key = hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    # Save to database
+    event = ArrivalEventModel(
+        tenant_id=uuid.UUID(tenant_id),
+        user_id=uuid.UUID(user_id),
+        order_id=uuid.UUID(order_id),
+        kitchen_id=uuid.UUID(kitchen_id),
+        signal_type=signal_type,
+        latitude=latitude,
+        longitude=longitude,
+        distance_meters=distance_meters,
+        is_valid=is_valid,
+        idempotency_key=idempotency_key,
+    )
+    session.add(event)
+    await session.commit()
+
+    # Publish arrival event to Kafka
+    if _kafka_producer:
+        await _kafka_producer.publish(
+            topic="hotsot.arrival.events.v1",
+            key=order_id,
+            value={
+                "event_id": generate_id(),
+                "event_type": EventType.ARRIVAL_DETECTED.value,
+                "order_id": order_id,
+                "kitchen_id": kitchen_id,
+                "tenant_id": tenant_id,
+                "source": "arrival-service",
+                "timestamp": now_iso(),
+                "schema_version": 2,
+                "payload": {
+                    "user_id": user_id,
+                    "signal_type": signal_type,
+                    "distance_meters": distance_meters,
+                    "proximity": classify_proximity(distance_meters) if distance_meters else "IMMEDIATE",
+                    "arrival_boost": 20.0,
+                    "validated": is_valid,
+                },
+            },
         )
 
-    # ── 4. Build response ──────────────────────────────────────────
-    arrival_id = str(uuid.uuid4())
-    now_iso = datetime.now(tz=timezone.utc).isoformat()
-
+    # Store idempotency response
     response_data = {
-        "arrival_id": arrival_id,
-        "order_id": body.order_id,
-        "user_id": body.user_id,
-        "kitchen_id": body.kitchen_id,
-        "is_arrived": verdict.is_arrived,
-        "strength": verdict.strength.value,
-        "arrival_type": verdict.arrival_type.value,
-        "distance_m": verdict.distance_m if verdict.distance_m else None,
-        "threshold_m": verdict.threshold_m if verdict.threshold_m else None,
-        "priority_boosted": priority_boosted,
-        "message": message,
-        "detected_at": now_iso,
+        "order_id": order_id,
+        "is_valid": is_valid,
+        "distance_meters": round(distance_meters, 1) if distance_meters else None,
+        "proximity": classify_proximity(distance_meters) if distance_meters else "IMMEDIATE",
+        "signal_type": signal_type,
     }
+    if idempotency_key and _redis_client:
+        import json
+        await dedup.store_idempotency_key(
+            idempotency_key, json.dumps(response_data), tenant_id
+        )
 
-    # ── 5. Store active arrival ────────────────────────────────────
-    active = ActiveArrival(
-        order_id=body.order_id,
-        user_id=body.user_id,
-        kitchen_id=body.kitchen_id,
-        detected_at=time.time(),
-        strength=verdict.strength.value,
-        arrival_type=verdict.arrival_type.value,
-    )
-    await dedup.set_active_arrival(active)
+    return response_data
 
-    # ── 6. Emit Kafka events (fire-and-forget) ─────────────────────
-    arrival_event = {
-        "event_type": "arrival.detected",
-        "arrival_id": arrival_id,
-        "order_id": body.order_id,
-        "user_id": body.user_id,
-        "kitchen_id": body.kitchen_id,
-        "strength": verdict.strength.value,
-        "arrival_type": verdict.arrival_type.value,
-        "distance_m": verdict.distance_m,
-        "priority_boosted": priority_boosted,
-        "detected_at": now_iso,
-    }
-    await _emit_kafka_event(settings.kafka_arrival_topic, arrival_event)
 
-    # Priority boost event — only for HARD arrivals
-    if priority_boosted:
-        boost_event = {
-            "event_type": "priority.boost",
-            "order_id": body.order_id,
-            "user_id": body.user_id,
-            "kitchen_id": body.kitchen_id,
-            "boost_amount": settings.priority_boost_amount,
-            "reason": "arrival_detected",
-            "detected_at": now_iso,
-        }
-        await _emit_kafka_event(settings.kafka_priority_topic, boost_event)
-
-    # Staff notification — on any arrival (hard or soft)
-    staff_event = {
-        "event_type": "staff.arrival_notification",
-        "order_id": body.order_id,
-        "user_id": body.user_id,
-        "kitchen_id": body.kitchen_id,
-        "strength": verdict.strength.value,
-        "arrival_type": verdict.arrival_type.value,
-        "action": "flash_and_ping",
-        "detected_at": now_iso,
-    }
-    await _emit_kafka_event(settings.kafka_staff_notification_topic, staff_event)
-
-    # ── 7. Store idempotency ───────────────────────────────────────
-    await _store_idempotency(body.idempotency_key, response_data)
-
-    logger.info(
-        "Arrival detected: order=%s user=%s strength=%s type=%s boosted=%s",
-        body.order_id, body.user_id, verdict.strength.value,
-        verdict.arrival_type.value, priority_boosted,
+@router.post("/qr-scan")
+async def qr_scan_arrival(
+    order_id: str,
+    user_id: str,
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """QR scan-based arrival (always valid — user is physically at kitchen)."""
+    return await detect_arrival(
+        order_id=order_id,
+        user_id=user_id,
+        kitchen_id=kitchen_id,
+        kitchen_lat=0, kitchen_lng=0,
+        qr_scan=True,
+        user=user,
+        session=session,
     )
 
-    return ArrivalDetectResponse(**response_data)
 
-
-@router.get(
-    "/{order_id}/status",
-    response_model=ArrivalStatusResponse,
-    summary="Get arrival status",
-    description="Retrieve the current arrival status for an order.",
-)
+@router.get("/{order_id}/status")
 async def get_arrival_status(
     order_id: str,
-    dedup: ArrivalDedupEngine = Depends(get_dedup_engine),
-) -> ArrivalStatusResponse:
-    arrival = await dedup.get_active_arrival(order_id)
-    if arrival:
-        # Convert detected_at back to ISO format if it's a timestamp string
-        detected_at_raw = arrival.get("detected_at", "")
-        try:
-            ts = float(detected_at_raw)
-            detected_at_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        except (ValueError, TypeError):
-            detected_at_iso = detected_at_raw
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get latest arrival status for an order."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-        arrival_data = {
-            "order_id": arrival.get("order_id", order_id),
-            "user_id": arrival.get("user_id", ""),
-            "kitchen_id": arrival.get("kitchen_id", ""),
-            "detected_at": detected_at_iso,
-            "strength": arrival.get("strength", ""),
-            "arrival_type": arrival.get("arrival_type", ""),
-        }
-        return ArrivalStatusResponse(
-            order_id=order_id,
-            has_active_arrival=True,
-            arrival=arrival_data,
-        )
-
-    return ArrivalStatusResponse(
-        order_id=order_id,
-        has_active_arrival=False,
-        arrival=None,
+    result = await session.execute(
+        select(ArrivalEventModel).where(
+            ArrivalEventModel.order_id == uuid.UUID(order_id),
+            ArrivalEventModel.tenant_id == uuid.UUID(tenant_id),
+        ).order_by(ArrivalEventModel.detected_at.desc()).limit(1)
     )
+    event = result.scalar_one_or_none()
+
+    if not event:
+        return {"order_id": order_id, "arrived": False}
+
+    return {
+        "order_id": order_id,
+        "arrived": event.is_valid,
+        "signal_type": event.signal_type,
+        "distance_meters": event.distance_meters,
+        "detected_at": event.detected_at.isoformat() if event.detected_at else None,
+    }
 
 
-@router.post(
-    "/{order_id}/qr-token",
-    response_model=QRTokenResponse,
-    summary="Generate QR token for handoff",
-    description=(
-        "Generate a time-bounded QR token that the kitchen staff can "
-        "display for the customer to scan.  Tokens rotate every 30 s."
-    ),
-)
-async def generate_qr_token(
-    order_id: str,
-    kitchen_id: str = Field(..., description="Kitchen ID for the token binding"),
-) -> QRTokenResponse:
-    settings = get_settings()
-    token, expires_at = _generate_qr_token(order_id, kitchen_id)
-
-    return QRTokenResponse(
-        order_id=order_id,
-        token=token,
-        expires_at=expires_at,
-        rotation_s=settings.qr_token_rotation_s,
-    )
-
-
-@router.get(
-    "/kitchen/{kitchen_id}/waiting",
-    response_model=WaitingListResponse,
-    summary="Get waiting users for a kitchen",
-    description="List all users with active arrivals at a kitchen.",
-)
-async def get_waiting_users(
+@router.get("/kitchen/{kitchen_id}/pending")
+async def get_pending_arrivals(
     kitchen_id: str,
-    dedup: ArrivalDedupEngine = Depends(get_dedup_engine),
-) -> WaitingListResponse:
-    raw = await dedup.get_waiting_for_kitchen(kitchen_id)
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get all pending (valid) arrivals for a kitchen."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-    waiting: list[WaitingUserResponse] = []
-    for entry in raw:
-        detected_at_raw = entry.get("detected_at", "")
-        try:
-            ts = float(detected_at_raw)
-            detected_at_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        except (ValueError, TypeError):
-            detected_at_iso = detected_at_raw
-
-        waiting.append(WaitingUserResponse(
-            order_id=entry.get("order_id", ""),
-            user_id=entry.get("user_id", ""),
-            kitchen_id=entry.get("kitchen_id", ""),
-            detected_at=detected_at_iso,
-            strength=entry.get("strength", ""),
-            arrival_type=entry.get("arrival_type", ""),
-        ))
-
-    return WaitingListResponse(
-        kitchen_id=kitchen_id,
-        count=len(waiting),
-        waiting=waiting,
+    result = await session.execute(
+        select(ArrivalEventModel).where(
+            ArrivalEventModel.kitchen_id == uuid.UUID(kitchen_id),
+            ArrivalEventModel.tenant_id == uuid.UUID(tenant_id),
+            ArrivalEventModel.is_valid == True,
+        ).order_by(ArrivalEventModel.detected_at.desc()).limit(50)
     )
+    events = result.scalars().all()
+
+    return {
+        "kitchen_id": kitchen_id,
+        "pending_arrivals": [
+            {
+                "order_id": str(e.order_id),
+                "user_id": str(e.user_id),
+                "signal_type": e.signal_type,
+                "distance_meters": e.distance_meters,
+                "detected_at": e.detected_at.isoformat() if e.detected_at else None,
+            }
+            for e in events
+        ],
+    }

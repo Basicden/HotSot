@@ -1,272 +1,90 @@
-"""HotSot Realtime Service — WebSocket Connection Manager.
-
-Manages WebSocket connection lifecycle, connection pools, and message
-broadcasting for both order-tracking and kitchen-dashboard clients.
-
-Features:
-  - Per-order connection pools (user tracking)
-  - Per-kitchen connection pools (staff dashboard)
-  - Health-check / heartbeat management
-  - Automatic cleanup on disconnect
-  - Atomic broadcast with disconnect tracking
-  - Connection count metrics
-"""
-
+"""HotSot Realtime Service — Connection Manager."""
+import json
 import logging
-import time
-from typing import Dict, Set, List, Any, Optional
-from datetime import datetime
+from typing import Dict, Set, Optional
 from fastapi import WebSocket
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("realtime-service.manager")
 
 
 class ConnectionManager:
-    """Manages all WebSocket connections for the Realtime Service.
+    """Manages WebSocket connections for vendors and SSE for customers.
 
-    Maintains two connection pools:
-      - order_connections: order_id → Set[WebSocket]
-      - kitchen_connections: kitchen_id → Set[WebSocket]
-
-    Thread-safety: Designed for single-process async (FastAPI/uvicorn).
-    For multi-process, connections are kept local and Redis pub/sub is used
-    for cross-instance broadcasting.
+    Architecture:
+    - Vendors (kitchen staff): WebSocket for bidirectional real-time
+    - Customers: SSE for unidirectional updates (simpler, more reliable)
+    - Redis pub/sub for cross-instance routing
     """
 
     def __init__(self):
-        # Order tracking connections: user subscribes to their order
-        self.order_connections: Dict[str, Set[WebSocket]] = {}
+        # kitchen_id -> set of websocket connections
+        self._vendor_connections: Dict[str, Set[WebSocket]] = {}
+        # user_id -> set of SSE queues
+        self._customer_connections: Dict[str, Set] = {}
 
-        # Kitchen dashboard connections: staff subscribes to their kitchen
-        self.kitchen_connections: Dict[str, Set[WebSocket]] = {}
-
-        # Metadata for each connection
-        self._connection_meta: Dict[int, Dict[str, Any]] = {}
-
-    # ──────────────────────────────────────────
-    # Order connections
-    # ──────────────────────────────────────────
-
-    async def connect_order(self, order_id: str, websocket: WebSocket) -> None:
-        """Accept and register an order-tracking WebSocket connection.
-
-        Args:
-            order_id: The order to subscribe to
-            websocket: The WebSocket connection
-        """
+    async def connect_vendor(self, websocket: WebSocket, kitchen_id: str):
+        """Accept and register vendor WebSocket connection."""
         await websocket.accept()
-        if order_id not in self.order_connections:
-            self.order_connections[order_id] = set()
-        self.order_connections[order_id].add(websocket)
-        self._connection_meta[id(websocket)] = {
-            "type": "order",
-            "order_id": order_id,
-            "connected_at": time.time(),
-        }
-        logger.info(
-            "Order WS connected: order=%s, total=%d",
-            order_id,
-            len(self.order_connections[order_id]),
-        )
+        if kitchen_id not in self._vendor_connections:
+            self._vendor_connections[kitchen_id] = set()
+        self._vendor_connections[kitchen_id].add(websocket)
+        logger.info("vendor_connected", kitchen_id=kitchen_id)
 
-    def disconnect_order(self, order_id: str, websocket: WebSocket) -> None:
-        """Remove an order-tracking WebSocket connection.
+    def disconnect_vendor(self, websocket: WebSocket, kitchen_id: str):
+        """Remove vendor WebSocket connection."""
+        if kitchen_id in self._vendor_connections:
+            self._vendor_connections[kitchen_id].discard(websocket)
+            if not self._vendor_connections[kitchen_id]:
+                del self._vendor_connections[kitchen_id]
+        logger.info("vendor_disconnected", kitchen_id=kitchen_id)
 
-        Args:
-            order_id: The order being subscribed to
-            websocket: The WebSocket connection to remove
-        """
-        if order_id in self.order_connections:
-            self.order_connections[order_id].discard(websocket)
-            if not self.order_connections[order_id]:
-                del self.order_connections[order_id]
-        self._connection_meta.pop(id(websocket), None)
-        logger.info("Order WS disconnected: order=%s", order_id)
-
-    async def broadcast_to_order(
-        self, order_id: str, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, int]:
-        """Broadcast a message to all connections subscribed to an order.
-
-        Args:
-            order_id: Target order
-            event_type: Event type string (e.g. 'ORDER_STATUS_CHANGED')
-            payload: Event data
-
-        Returns:
-            Dict with delivered and failed counts
-        """
-        connections = self.order_connections.get(order_id, set())
-        message = {
-            "type": event_type,
-            "order_id": order_id,
-            "payload": payload,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        return await self._broadcast(connections, message)
-
-    # ──────────────────────────────────────────
-    # Kitchen connections
-    # ──────────────────────────────────────────
-
-    async def connect_kitchen(self, kitchen_id: str, websocket: WebSocket) -> None:
-        """Accept and register a kitchen-dashboard WebSocket connection.
-
-        Args:
-            kitchen_id: The kitchen to subscribe to
-            websocket: The WebSocket connection
-        """
-        await websocket.accept()
-        if kitchen_id not in self.kitchen_connections:
-            self.kitchen_connections[kitchen_id] = set()
-        self.kitchen_connections[kitchen_id].add(websocket)
-        self._connection_meta[id(websocket)] = {
-            "type": "kitchen",
-            "kitchen_id": kitchen_id,
-            "connected_at": time.time(),
-        }
-        logger.info(
-            "Kitchen WS connected: kitchen=%s, total=%d",
-            kitchen_id,
-            len(self.kitchen_connections[kitchen_id]),
-        )
-
-    def disconnect_kitchen(self, kitchen_id: str, websocket: WebSocket) -> None:
-        """Remove a kitchen-dashboard WebSocket connection."""
-        if kitchen_id in self.kitchen_connections:
-            self.kitchen_connections[kitchen_id].discard(websocket)
-            if not self.kitchen_connections[kitchen_id]:
-                del self.kitchen_connections[kitchen_id]
-        self._connection_meta.pop(id(websocket), None)
-        logger.info("Kitchen WS disconnected: kitchen=%s", kitchen_id)
-
-    async def broadcast_to_kitchen(
-        self, kitchen_id: str, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, int]:
-        """Broadcast a message to all connections for a kitchen.
-
-        Args:
-            kitchen_id: Target kitchen
-            event_type: Event type string (e.g. 'NEW_ORDER', 'ARRIVAL_ALERT')
-            payload: Event data
-
-        Returns:
-            Dict with delivered and failed counts
-        """
-        connections = self.kitchen_connections.get(kitchen_id, set())
-        message = {
-            "type": event_type,
-            "kitchen_id": kitchen_id,
-            "payload": payload,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        return await self._broadcast(connections, message)
-
-    # ──────────────────────────────────────────
-    # Global broadcast
-    # ──────────────────────────────────────────
-
-    async def broadcast_global(
-        self, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, int]:
-        """Broadcast a message to ALL connected clients.
-
-        Use sparingly — only for system-wide announcements.
-        """
-        message = {
-            "type": event_type,
-            "payload": payload,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        total_delivered = 0
-        total_failed = 0
-
-        for connections in list(self.order_connections.values()):
-            result = await self._broadcast(connections, message)
-            total_delivered += result["delivered"]
-            total_failed += result["failed"]
-
-        for connections in list(self.kitchen_connections.values()):
-            result = await self._broadcast(connections, message)
-            total_delivered += result["delivered"]
-            total_failed += result["failed"]
-
-        return {"delivered": total_delivered, "failed": total_failed}
-
-    # ──────────────────────────────────────────
-    # Internal helpers
-    # ──────────────────────────────────────────
-
-    async def _broadcast(
-        self, connections: Set[WebSocket], message: Dict[str, Any]
-    ) -> Dict[str, int]:
-        """Send a message to a set of WebSocket connections.
-
-        Tracks disconnected clients and removes them from the pool.
-
-        Returns:
-            Dict with 'delivered' and 'failed' counts
-        """
-        delivered = 0
-        disconnected = set()
-
+    async def send_to_kitchen(self, kitchen_id: str, message: dict):
+        """Send message to all connections for a kitchen."""
+        connections = self._vendor_connections.get(kitchen_id, set())
+        dead = set()
         for ws in connections:
             try:
                 await ws.send_json(message)
-                delivered += 1
-            except Exception as exc:
-                logger.debug("WS send failed: %s", exc)
-                disconnected.add(ws)
-
-        # Clean up disconnected
-        for ws in disconnected:
+            except Exception:
+                dead.add(ws)
+        # Clean up dead connections
+        for ws in dead:
             connections.discard(ws)
-            self._connection_meta.pop(id(ws), None)
 
-        return {
-            "delivered": delivered,
-            "failed": len(disconnected),
-        }
+    async def register_customer(self, user_id: str, queue):
+        """Register customer SSE queue."""
+        if user_id not in self._customer_connections:
+            self._customer_connections[user_id] = set()
+        self._customer_connections[user_id].add(queue)
 
-    # ──────────────────────────────────────────
-    # Metrics
-    # ──────────────────────────────────────────
+    def unregister_customer(self, user_id: str, queue):
+        """Unregister customer SSE queue."""
+        if user_id in self._customer_connections:
+            self._customer_connections[user_id].discard(queue)
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Return connection statistics."""
-        total_order = sum(len(conns) for conns in self.order_connections.values())
-        total_kitchen = sum(len(conns) for conns in self.kitchen_connections.values())
+    async def send_to_customer(self, user_id: str, message: dict):
+        """Send update to customer via SSE."""
+        queues = self._customer_connections.get(user_id, set())
+        for q in queues:
+            try:
+                await q.put(message)
+            except Exception:
+                pass
 
-        return {
-            "total_order_connections": total_order,
-            "total_kitchen_connections": total_kitchen,
-            "unique_orders_tracked": len(self.order_connections),
-            "unique_kitchens_online": len(self.kitchen_connections),
-            "total_connections": total_order + total_kitchen,
-        }
+    async def broadcast(self, message: dict, kitchen_id: str = None, user_id: str = None):
+        """Broadcast message to relevant connections."""
+        if kitchen_id:
+            await self.send_to_kitchen(kitchen_id, message)
+        if user_id:
+            await self.send_to_customer(user_id, message)
 
-    def get_order_connections(self, order_id: str) -> int:
-        """Return number of active connections for an order."""
-        return len(self.order_connections.get(order_id, set()))
+    @property
+    def vendor_count(self) -> int:
+        return sum(len(conns) for conns in self._vendor_connections.values())
 
-    def get_kitchen_connections(self, kitchen_id: str) -> int:
-        """Return number of active connections for a kitchen."""
-        return len(self.kitchen_connections.get(kitchen_id, set()))
+    @property
+    def customer_count(self) -> int:
+        return sum(len(conns) for conns in self._customer_connections.values())
 
-    async def close_all(self) -> None:
-        """Close all WebSocket connections (graceful shutdown)."""
-        for connections in list(self.order_connections.values()):
-            for ws in connections:
-                try:
-                    await ws.close(code=1001, reason="Server shutting down")
-                except Exception:
-                    pass
-        for connections in list(self.kitchen_connections.values()):
-            for ws in connections:
-                try:
-                    await ws.close(code=1001, reason="Server shutting down")
-                except Exception:
-                    pass
-        self.order_connections.clear()
-        self.kitchen_connections.clear()
-        self._connection_meta.clear()
+
+manager = ConnectionManager()

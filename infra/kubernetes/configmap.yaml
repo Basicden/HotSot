@@ -1,32 +1,484 @@
+# HotSot V2 — Kubernetes ConfigMap for all 18 microservices
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hotsot-config
+  namespace: hotsot
 data:
-  ORDER_SERVICE_URL: "http://order-service:8001"
-  KITCHEN_SERVICE_URL: "http://kitchen-service:8002"
-  SHELF_SERVICE_URL: "http://shelf-service:8003"
-  ETA_SERVICE_URL: "http://eta-service:8004"
-  NOTIFICATION_SERVICE_URL: "http://notification-service:8005"
-  REALTIME_SERVICE_URL: "http://realtime-service:8006"
-  ML_SERVICE_URL: "http://ml-service:8007"
-  ARRIVAL_SERVICE_URL: "http://arrival-service:8008"
-  COMPENSATION_SERVICE_URL: "http://compensation-service:8010"
-  REDIS_URL: "redis://redis:6379/0"
-  KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
-  DATABASE_URL: "postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot"
-  kafka-bootstrap: "kafka-cluster:9092"
-  redis-url: "redis://redis-cluster:6379"
-  log-level: "INFO"
-  environment: "production"
-  region: "ap-south-1"
+  ENVIRONMENT: "production"
+  KAFKA_BOOTSTRAP: "kafka.hotsot.svc.cluster.local:9092"
+  REDIS_URL: "redis://redis.hotsot.svc.cluster.local:6379/0"
+  POSTGRES_HOST: "postgres.hotsot.svc.cluster.local"
+  POSTGRES_USER: "hotsot"
+  POSTGRES_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+  JWT_SECRET_KEY: "CHANGE_ME_JWT_SECRET"
+  AUTH_SECRET: "CHANGE_ME_AUTH_SECRET"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger.hotsot.svc.cluster.local:4317"
+  RAZORPAY_KEY_ID: "CHANGE_ME_RAZORPAY_KEY"
+  RAZORPAY_KEY_SECRET: "CHANGE_ME_RAZORPAY_SECRET"
+---
+# Shared service template — each service gets its own Deployment + Service
+# Below are all 18 service Deployments
+
+# ═══════════════════════════════════════════════════════════════
+# ORDER SERVICE
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: hotsot
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: hotsot/order-service:latest
+        ports:
+        - containerPort: 8001
+        envFrom:
+        - configMapRef:
+            name: hotsot-config
+        env:
+        - name: SERVICE_NAME
+          value: "order"
+        - name: DATABASE_URL
+          value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_order"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8001
+          initialDelaySeconds: 15
+          periodSeconds: 5
 ---
 apiVersion: v1
-kind: Secret
+kind: Service
 metadata:
-  name: hotsot-secrets
-type: Opaque
-stringData:
-  database-url: "postgresql+asyncpg://hotsot:CHANGE_ME@rds-endpoint.ap-south-1.rds.amazonaws.com:5432/hotsot"
-  redis-url: "redis://:CHANGE_ME@redis-cluster.ap-south-1.001.cache.amazonaws.com:6379/0"
-  auth-secret: "CHANGE_ME_IN_PRODUCTION"
+  name: order-service
+  namespace: hotsot
+spec:
+  selector:
+    app: order-service
+  ports:
+  - port: 8001
+    targetPort: 8001
+
+---
+# ═══════════════════════════════════════════════════════════════
+# KITCHEN SERVICE
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kitchen-service
+  namespace: hotsot
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kitchen-service
+  template:
+    metadata:
+      labels:
+        app: kitchen-service
+    spec:
+      containers:
+      - name: kitchen-service
+        image: hotsot/kitchen-service:latest
+        ports:
+        - containerPort: 8002
+        envFrom:
+        - configMapRef:
+            name: hotsot-config
+        env:
+        - name: SERVICE_NAME
+          value: "kitchen"
+        - name: DATABASE_URL
+          value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_kitchen"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8002
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8002
+          initialDelaySeconds: 15
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitchen-service
+  namespace: hotsot
+spec:
+  selector:
+    app: kitchen-service
+  ports:
+  - port: 8002
+    targetPort: 8002
+
+---
+# ═══════════════════════════════════════════════════════════════
+# V2 NEW SERVICES (vendor, menu, search, pricing, compliance,
+#                   billing, analytics, config)
+# ═══════════════════════════════════════════════════════════════
+
+# VENDOR SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vendor-service
+  namespace: hotsot
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vendor-service
+  template:
+    metadata:
+      labels:
+        app: vendor-service
+    spec:
+      containers:
+      - name: vendor-service
+        image: hotsot/vendor-service:latest
+        ports:
+        - containerPort: 8010
+        envFrom:
+        - configMapRef:
+            name: hotsot-config
+        env:
+        - name: SERVICE_NAME
+          value: "vendor"
+        - name: DATABASE_URL
+          value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_vendor"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+        livenessProbe:
+          httpGet: { path: /health/live, port: 8010 }
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        readinessProbe:
+          httpGet: { path: /health/ready, port: 8010 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vendor-service
+  namespace: hotsot
+spec:
+  selector: { app: vendor-service }
+  ports:
+  - { port: 8010, targetPort: 8010 }
+
+---
+# MENU SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: menu-service
+  namespace: hotsot
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: menu-service }
+  template:
+    metadata:
+      labels: { app: menu-service }
+    spec:
+      containers:
+      - name: menu-service
+        image: hotsot/menu-service:latest
+        ports: [{ containerPort: 8011 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "menu" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_menu" }
+        resources:
+          requests: { memory: "128Mi", cpu: "100m" }
+          limits: { memory: "256Mi", cpu: "250m" }
+        livenessProbe: { httpGet: { path: /health/live, port: 8011 }, initialDelaySeconds: 20, periodSeconds: 10 }
+        readinessProbe: { httpGet: { path: /health/ready, port: 8011 }, initialDelaySeconds: 10, periodSeconds: 5 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: menu-service
+  namespace: hotsot
+spec:
+  selector: { app: menu-service }
+  ports: [{ port: 8011, targetPort: 8011 }]
+
+---
+# SEARCH SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: hotsot
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: search-service } }
+  template:
+    metadata: { labels: { app: search-service } }
+    spec:
+      containers:
+      - name: search-service
+        image: hotsot/search-service:latest
+        ports: [{ containerPort: 8012 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "search" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_search" }
+        resources:
+          requests: { memory: "128Mi", cpu: "100m" }
+          limits: { memory: "256Mi", cpu: "250m" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-service
+  namespace: hotsot
+spec:
+  selector: { app: search-service }
+  ports: [{ port: 8012, targetPort: 8012 }]
+
+---
+# PRICING SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pricing-service
+  namespace: hotsot
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: pricing-service } }
+  template:
+    metadata: { labels: { app: pricing-service } }
+    spec:
+      containers:
+      - name: pricing-service
+        image: hotsot/pricing-service:latest
+        ports: [{ containerPort: 8013 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "pricing" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_pricing" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pricing-service
+  namespace: hotsot
+spec:
+  selector: { app: pricing-service }
+  ports: [{ port: 8013, targetPort: 8013 }]
+
+---
+# COMPLIANCE SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compliance-service
+  namespace: hotsot
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: compliance-service } }
+  template:
+    metadata: { labels: { app: compliance-service } }
+    spec:
+      containers:
+      - name: compliance-service
+        image: hotsot/compliance-service:latest
+        ports: [{ containerPort: 8014 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "compliance" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_compliance" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: compliance-service
+  namespace: hotsot
+spec:
+  selector: { app: compliance-service }
+  ports: [{ port: 8014, targetPort: 8014 }]
+
+---
+# BILLING SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  namespace: hotsot
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: billing-service } }
+  template:
+    metadata: { labels: { app: billing-service } }
+    spec:
+      containers:
+      - name: billing-service
+        image: hotsot/billing-service:latest
+        ports: [{ containerPort: 8015 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "billing" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_billing" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service
+  namespace: hotsot
+spec:
+  selector: { app: billing-service }
+  ports: [{ port: 8015, targetPort: 8015 }]
+
+---
+# ANALYTICS SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-service
+  namespace: hotsot
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: analytics-service } }
+  template:
+    metadata: { labels: { app: analytics-service } }
+    spec:
+      containers:
+      - name: analytics-service
+        image: hotsot/analytics-service:latest
+        ports: [{ containerPort: 8016 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "analytics" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_analytics" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-service
+  namespace: hotsot
+spec:
+  selector: { app: analytics-service }
+  ports: [{ port: 8016, targetPort: 8016 }]
+
+---
+# CONFIG SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-service
+  namespace: hotsot
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: config-service } }
+  template:
+    metadata: { labels: { app: config-service } }
+    spec:
+      containers:
+      - name: config-service
+        image: hotsot/config-service:latest
+        ports: [{ containerPort: 8017 }]
+        envFrom: [{ configMapRef: { name: hotsot-config } }]
+        env:
+        - { name: SERVICE_NAME, value: "config" }
+        - { name: DATABASE_URL, value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):5432/hotsot_config" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-service
+  namespace: hotsot
+spec:
+  selector: { app: config-service }
+  ports: [{ port: 8017, targetPort: 8017 }]
+
+---
+# HPA for core services (auto-scale based on load)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service-hpa
+  namespace: hotsot
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kitchen-service-hpa
+  namespace: hotsot
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kitchen-service
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

@@ -11,8 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code
-COPY . .
+# Shared library
+COPY shared/ /app/shared/
 
-# Default: run order-service (override per service)
-CMD ["uvicorn", "services.order-service.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# All services
+COPY services/ /app/services/
+
+# Default: run order-service (override SERVICE env var per container)
+ENV SERVICE=order
+ENV PORT=8000
+
+CMD uvicorn services.${SERVICE}-service.app.main:app --host 0.0.0.0 --port ${PORT}

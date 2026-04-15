@@ -1,40 +1,47 @@
-"""HotSot Kitchen Service — Unit Tests."""
+"""HotSot Kitchen Service — Test Suite."""
+
 import pytest
-from app.core.engine import KitchenEngine
+from app.core.engine import PriorityScoreCalculator, QueueManager, BatchEngine
 
-engine = KitchenEngine()
 
-def test_enqueue_normal():
-    result = engine.enqueue("k_001", "o_001", priority="NORMAL")
-    assert result["queue_position"] >= 1
-    assert result["queue_name"] == "NORMAL"
+class TestPriorityScoreCalculator:
+    """Tests for the priority score calculator."""
 
-def test_enqueue_urgent():
-    result = engine.enqueue("k_001", "o_002", priority="URGENT", priority_score=80)
-    assert result["queue_name"] == "URGENT"
+    def test_free_tier_base_score(self):
+        score = PriorityScoreCalculator.calculate(user_tier="FREE")
+        assert score >= 5.0  # Minimum tier bonus
+        assert score <= 200.0
 
-def test_enqueue_batch():
-    result = engine.enqueue("k_001", "o_003", priority="BATCH", priority_score=15)
-    assert result["queue_name"] == "BATCH"
+    def test_vip_tier_higher_than_free(self):
+        free_score = PriorityScoreCalculator.calculate(user_tier="FREE")
+        vip_score = PriorityScoreCalculator.calculate(user_tier="VIP")
+        assert vip_score > free_score
 
-def test_dequeue_urgent_first():
-    engine.enqueue("k_test", "o_normal", priority="NORMAL", priority_score=40)
-    engine.enqueue("k_test", "o_urgent", priority="URGENT", priority_score=85)
-    result = engine.dequeue("k_test")
-    assert result["order_id"] == "o_urgent"
+    def test_arrival_boost(self):
+        no_boost = PriorityScoreCalculator.calculate(user_tier="FREE", arrival_boost=0)
+        with_boost = PriorityScoreCalculator.calculate(user_tier="FREE", arrival_boost=20)
+        assert with_boost > no_boost
 
-def test_dequeue_fifo_within_queue():
-    engine.enqueue("k_fifo", "o_first", priority="NORMAL", priority_score=40)
-    engine.enqueue("k_fifo", "o_second", priority="NORMAL", priority_score=40)
-    first = engine.dequeue("k_fifo")
-    assert first["order_id"] == "o_first"
+    def test_queue_type_determination(self):
+        assert PriorityScoreCalculator.determine_queue_type(90) == "IMMEDIATE"
+        assert PriorityScoreCalculator.determine_queue_type(60) == "NORMAL"
+        assert PriorityScoreCalculator.determine_queue_type(30) == "BATCH"
 
-def test_empty_queue():
-    result = engine.dequeue("k_empty")
-    assert result is None
+    def test_batch_category_from_items(self):
+        items = [{"name": "biryani"}, {"name": "raita"}]
+        category = PriorityScoreCalculator.determine_batch_category(items)
+        assert category == "RICE_BOWL"
 
-def test_kitchen_status():
-    engine.enqueue("k_status", "o_001", priority="NORMAL")
-    status = engine.get_status("k_status")
-    assert "queue_depth" in status
-    assert status["queue_depth"] >= 1
+    def test_batch_category_empty_items(self):
+        category = PriorityScoreCalculator.determine_batch_category([])
+        assert category is None
+
+    def test_score_max_cap(self):
+        score = PriorityScoreCalculator.calculate(
+            user_tier="VIP",
+            arrival_proximity=0,
+            delay_risk=1.0,
+            order_age_seconds=3600,
+            arrival_boost=50,
+        )
+        assert score <= 200.0

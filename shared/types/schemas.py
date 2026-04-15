@@ -1,9 +1,19 @@
-"""HotSot Shared Types — V2 Production-Grade Cross-service Type Definitions."""
+"""
+HotSot Shared Types — V2 Production-Grade Cross-service Type Definitions.
+
+This is the canonical type system for all HotSot services.
+Includes the 16-state order lifecycle, complete event taxonomy,
+and all request/response schemas.
+
+All models include tenant_id for multi-tenancy support.
+"""
+
+from __future__ import annotations
 
 from enum import Enum
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field
-from datetime import datetime
+from pydantic import BaseModel, Field, ConfigDict
+from datetime import datetime, timezone
 import uuid
 
 
@@ -184,22 +194,39 @@ PEAK_DEGRADATION = 0.40  # -40% throughput during peak
 # ═══════════════════════════════════════════════════════════════
 
 class EventEnvelope(BaseModel):
-    """Canonical event envelope — every event inherits this structure."""
+    """
+    Canonical event envelope — every event inherits this structure.
+
+    All events in the system must conform to this envelope for:
+    - Schema version validation
+    - Idempotency enforcement
+    - Traceability (correlation across services)
+    - Multi-tenant isolation
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     event_type: EventType
     order_id: str
     kitchen_id: Optional[str] = None
+    tenant_id: str = Field(default="default")
     sequence_number: int = 0
     idempotency_key: Optional[str] = None
     source: str
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     schema_version: int = 2
     payload: Dict[str, Any] = Field(default_factory=dict)
+    correlation_id: Optional[str] = None
 
 
 class OrderCreateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     user_id: str
     kitchen_id: str
+    tenant_id: str = Field(default="default")
     items: List[Dict[str, Any]] = Field(default_factory=list)
     total_amount: Optional[float] = None
     payment_method: str = "UPI"
@@ -209,22 +236,31 @@ class OrderCreateRequest(BaseModel):
 
 
 class PaymentInitRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     payment_method: str = "UPI"
     upi_id: Optional[str] = None
     idempotency_key: Optional[str] = None
 
 
 class PaymentConfirmRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     payment_ref: str
+    tenant_id: str = Field(default="default")
     payment_method: str = "UPI"
     gateway_txn_id: Optional[str] = None
     idempotency_key: Optional[str] = None
 
 
 class ArrivalRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
     user_id: str
+    tenant_id: str = Field(default="default")
     latitude: float
     longitude: float
     qr_scan: bool = False
@@ -232,21 +268,31 @@ class ArrivalRequest(BaseModel):
 
 
 class HandoffConfirmRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     staff_id: str
     confirmation_method: str = "QR_SCAN"  # QR_SCAN, MANUAL_ACK
     idempotency_key: Optional[str] = None
 
 
 class CancelRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    order_id: str
+    tenant_id: str = Field(default="default")
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
 
 
 class OrderResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
     user_id: str
     kitchen_id: str
+    tenant_id: str = Field(default="default")
     status: str
     queue_type: Optional[str] = None
     queue_position: Optional[int] = None
@@ -265,12 +311,18 @@ class OrderResponse(BaseModel):
 
 
 class EventLogResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     events: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ETAResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     eta_seconds: int
     confidence_interval: List[int] = Field(default_factory=lambda: [0, 0])
     risk_level: RiskLevel = RiskLevel.LOW
@@ -279,14 +331,20 @@ class ETAResponse(BaseModel):
 
 
 class ShelfAssignment(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     shelf_id: str
     zone: ShelfZone = ShelfZone.HOT
     ttl_seconds: int = 600
 
 
 class KitchenPriorityScore(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     score: float
     arrival_proximity: float
     delay_risk: float
@@ -297,7 +355,10 @@ class KitchenPriorityScore(BaseModel):
 
 
 class CompensationEvent(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     order_id: str
+    tenant_id: str = Field(default="default")
     reason: str  # SHELF_EXPIRED, KITCHEN_FAILURE, PAYMENT_CONFLICT
     amount: float
     currency: str = "INR"
@@ -305,8 +366,11 @@ class CompensationEvent(BaseModel):
 
 
 class IncidentEvent(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     incident_id: str
     kitchen_id: str
+    tenant_id: str = Field(default="default")
     incident_type: str  # DELAY_SPIKE, KITCHEN_DOWN, SHELF_OVERFLOW
     severity: RiskLevel = RiskLevel.HIGH
     affected_orders: List[str] = Field(default_factory=list)
@@ -314,12 +378,18 @@ class IncidentEvent(BaseModel):
 
 
 class DLQMessage(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     original_event: Dict[str, Any]
+    original_topic: Optional[str] = None
     failure_reason: str
     consumer_service: str
+    tenant_id: str = Field(default="default")
     retry_count: int = 0
     last_error: Optional[str] = None
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

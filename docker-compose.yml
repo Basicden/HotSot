@@ -1,13 +1,28 @@
 version: "3.9"
 
+# ═══════════════════════════════════════════════════════════════
+# HotSot V2 — Production-Grade Docker Compose for 18 Microservices
+# Database-per-Service | Multi-Tenancy | Kafka | Redis | Observability
+# ═══════════════════════════════════════════════════════════════
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP: kafka:29092
+  REDIS_URL: redis://redis:6379/0
+  ENVIRONMENT: development
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:-hotsot-dev-secret-change-in-production}
+  AUTH_SECRET: ${AUTH_SECRET:-hotsot-dev-auth-secret}
+
+x-db-env: &db-env
+  POSTGRES_USER: hotsot
+  POSTGRES_PASSWORD: hotsot_dev_pass
+
 services:
-  # ─── INFRASTRUCTURE ───
+  # ─── INFRASTRUCTURE ─────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
+      <<: *db-env
       POSTGRES_DB: hotsot
-      POSTGRES_USER: hotsot
-      POSTGRES_PASSWORD: hotsot_dev_pass
     ports:
       - "5432:5432"
     volumes:
@@ -23,7 +38,9 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -50,39 +67,64 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
 
-  # ─── SERVICES ───
+  jaeger:
+    image: jaegertracing/all-in-one:1.53
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+
+  # ─── API GATEWAY ────────────────────────────────────────────
   api-gateway:
     build:
-      context: ./services/api-gateway
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
+      <<: *common-env
       ORDER_SERVICE_URL: http://order-service:8001
       KITCHEN_SERVICE_URL: http://kitchen-service:8002
       SHELF_SERVICE_URL: http://shelf-service:8003
       ETA_SERVICE_URL: http://eta-service:8004
       NOTIFICATION_SERVICE_URL: http://notification-service:8005
+      REALTIME_SERVICE_URL: http://realtime-service:8006
+      ML_SERVICE_URL: http://ml-service:8007
       ARRIVAL_SERVICE_URL: http://arrival-service:8008
-      COMPENSATION_SERVICE_URL: http://compensation-service:8010
+      COMPENSATION_SERVICE_URL: http://compensation-service:8009
+      VENDOR_SERVICE_URL: http://vendor-service:8010
+      MENU_SERVICE_URL: http://menu-service:8011
+      SEARCH_SERVICE_URL: http://search-service:8012
+      PRICING_SERVICE_URL: http://pricing-service:8013
+      COMPLIANCE_SERVICE_URL: http://compliance-service:8014
+      BILLING_SERVICE_URL: http://billing-service:8015
+      ANALYTICS_SERVICE_URL: http://analytics-service:8016
+      CONFIG_SERVICE_URL: http://config-service:8017
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       - order-service
       - kitchen-service
-      - shelf-service
-      - arrival-service
-      - compensation-service
+      - redis
 
+  # ─── CORE SERVICES ─────────────────────────────────────────
   order-service:
     build:
-      context: ./services/order-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8001:8001"
     environment:
-      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP: kafka:29092
+      <<: *common-env
+      SERVICE_NAME: order
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_order
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-rzp_test_dev}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-dev_secret}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,100 +135,123 @@ services:
 
   kitchen-service:
     build:
-      context: ./services/kitchen-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8002:8002"
     environment:
-      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
-      REDIS_URL: redis://redis:6379/1
-      KAFKA_BOOTSTRAP: kafka:29092
+      <<: *common-env
+      SERVICE_NAME: kitchen
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_kitchen
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      kafka:
+        condition: service_started
 
   shelf-service:
     build:
-      context: ./services/shelf-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8003:8003"
     environment:
-      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot
-      REDIS_URL: redis://redis:6379/2
-      KAFKA_BOOTSTRAP: kafka:29092
+      <<: *common-env
+      SERVICE_NAME: shelf
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_shelf
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      kafka:
+        condition: service_started
 
   eta-service:
     build:
-      context: ./services/eta-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8004:8004"
     environment:
-      REDIS_URL: redis://redis:6379/3
-      KAFKA_BOOTSTRAP: kafka:29092
-      MODEL_PATH: /app/models/eta_model.txt
+      <<: *common-env
+      SERVICE_NAME: eta
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_eta
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
+      kafka:
+        condition: service_started
 
   notification-service:
     build:
-      context: ./services/notification-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8005:8005"
     environment:
-      KAFKA_BOOTSTRAP: kafka:29092
-      SMS_PROVIDER: mock
+      <<: *common-env
+      SERVICE_NAME: notification
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_notification
+      SMS_PROVIDER: ${SMS_PROVIDER:-mock}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
 
   realtime-service:
     build:
-      context: ./services/realtime-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8006:8006"
     environment:
-      KAFKA_BOOTSTRAP: kafka:29092
-      REDIS_URL: redis://redis:6379/4
+      <<: *common-env
+      SERVICE_NAME: realtime
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       redis:
         condition: service_healthy
 
   ml-service:
     build:
-      context: ./services/ml-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8007:8007"
     environment:
+      <<: *common-env
+      SERVICE_NAME: ml
       REDIS_URL: redis://redis:6379/5
-      S3_BUCKET: hotsot-ml-data
       MODEL_REGISTRY: /app/models
     volumes:
       - ./ml:/app/ml-src
 
   arrival-service:
     build:
-      context: ./services/arrival-service
+      context: .
       dockerfile: Dockerfile
     ports:
       - "8008:8008"
     environment:
-      REDIS_URL: redis://redis:6379/6
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      ARRIVAL_RADIUS_M: 150
-      QR_TOKEN_ROTATION_S: 30
-      DEDUP_WINDOW_S: 30
-      PRIORITY_BOOST_AMOUNT: 20
+      <<: *common-env
+      SERVICE_NAME: arrival
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_arrival
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
@@ -194,22 +259,166 @@ services:
 
   compensation-service:
     build:
-      context: ./services/compensation-service
+      context: .
       dockerfile: Dockerfile
     ports:
-      - "8010:8010"
+      - "8009:8009"
     environment:
-      REDIS_URL: redis://redis:6379/7
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DELAY_THRESHOLD_MINUTES: 15
-      CREDIT_NOTE_MIN_AMOUNT: 50.0
-      CREDIT_NOTE_MAX_AMOUNT: 100.0
-      SHELF_EXPIRATION_PENALTY_THRESHOLD: 3
+      <<: *common-env
+      SERVICE_NAME: compensation
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_compensation
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
         condition: service_started
 
+  # ─── NEW V2 SERVICES ───────────────────────────────────────
+  vendor-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8010:8010"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: vendor
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_vendor
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  menu-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8011:8011"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: menu
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_menu
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8012:8012"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: search
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_search
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  pricing-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8013:8013"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: pricing
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_pricing
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  compliance-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8014:8014"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: compliance
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_compliance
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  billing-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8015:8015"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: billing
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_billing
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  analytics-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8016:8016"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: analytics
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_analytics
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  config-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8017:8017"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: config
+      DATABASE_URL: postgresql+asyncpg://hotsot:hotsot_dev_pass@postgres:5432/hotsot_config
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  redisdata:

@@ -1,126 +1,236 @@
-"""HotSot Shelf Service — Shelf Routes.
+"""HotSot Shelf Service — Shelf Management Routes."""
 
-V2: Emits shelf Kafka events (assigned, released, expired) on every
-shelf lifecycle change so downstream services can react in real-time.
-"""
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, List
 
-import time
-from typing import Optional
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
 
-from app.core.redis_client import acquire_shelf_lock, release_shelf_lock, get_shelf_status, set_shelf_status, get_shelf_ttl
-from app.core.ttl_engine import ttl_engine
-from app.main import emit_shelf_event
+from shared.auth.jwt import get_current_user, require_role
+from shared.utils.helpers import now_iso, generate_id
+from shared.types.schemas import ShelfZone
+
+from app.core.database import ShelfSlotModel, ShelfAssignmentModel
+from app.core.ttl_engine import TTLEngine, SHELF_TTL_SECONDS
 
 router = APIRouter()
+_session_factory = None
+_redis_client = None
 
 
-class ShelfAssignRequest(BaseModel):
-    order_id: str
-    kitchen_id: str
-    zone: str = "HOT"
+def set_dependencies(session_factory, redis_client):
+    global _session_factory, _redis_client
+    _session_factory = session_factory
+    _redis_client = redis_client
 
 
-class ShelfReleaseRequest(BaseModel):
-    order_id: str
+async def get_session():
+    if _session_factory is None:
+        raise RuntimeError("Session factory not initialized")
+    async with _session_factory() as session:
+        yield session
+
+
+@router.get("/kitchen/{kitchen_id}")
+async def list_kitchen_shelves(
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """List all shelves for a kitchen."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    result = await session.execute(
+        select(ShelfSlotModel).where(
+            ShelfSlotModel.kitchen_id == uuid.UUID(kitchen_id),
+            ShelfSlotModel.tenant_id == uuid.UUID(tenant_id),
+        )
+    )
+    shelves = result.scalars().all()
+
+    # Enrich with TTL info
+    ttl_engine = TTLEngine(_redis_client) if _redis_client else None
+    shelf_data = []
+    for s in shelves:
+        info = {
+            "shelf_id": s.id,
+            "zone": s.zone,
+            "status": s.status,
+            "order_id": str(s.order_id) if s.order_id else None,
+        }
+        if ttl_engine:
+            ttl_status = await ttl_engine.check_shelf_status(s.id, tenant_id)
+            if ttl_status:
+                info["ttl_remaining"] = ttl_status.get("ttl_remaining")
+                info["warning_level"] = ttl_status.get("warning_level")
+        shelf_data.append(info)
+
+    return {"kitchen_id": kitchen_id, "shelves": shelf_data}
 
 
 @router.post("/assign")
-async def assign_shelf(req: ShelfAssignRequest):
-    """Assign an order to an available shelf slot with distributed lock."""
-    shelf_id = ttl_engine.find_available(req.kitchen_id, req.zone)
+async def assign_shelf(
+    order_id: str,
+    kitchen_id: str,
+    zone: str = "HOT",
+    shelf_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Assign order to a shelf slot."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+    ttl_seconds = SHELF_TTL_SECONDS.get(zone, 600)
+
+    # Auto-assign shelf if not specified
     if not shelf_id:
-        raise HTTPException(status_code=503, detail="No shelves available. Redirect to wait zone.")
+        result = await session.execute(
+            select(ShelfSlotModel).where(
+                ShelfSlotModel.kitchen_id == uuid.UUID(kitchen_id),
+                ShelfSlotModel.tenant_id == uuid.UUID(tenant_id),
+                ShelfSlotModel.status == "AVAILABLE",
+                ShelfSlotModel.zone == zone,
+            ).limit(1)
+        )
+        slot = result.scalar_one_or_none()
+        if not slot:
+            raise HTTPException(status_code=409, detail="No available shelf slots in this zone")
+        shelf_id = slot.id
+    else:
+        result = await session.execute(
+            select(ShelfSlotModel).where(ShelfSlotModel.id == shelf_id)
+        )
+        slot = result.scalar_one_or_none()
+        if not slot:
+            raise HTTPException(status_code=404, detail="Shelf not found")
+        if slot.status != "AVAILABLE":
+            raise HTTPException(status_code=409, detail="Shelf is not available")
 
-    lock_acquired = await acquire_shelf_lock(shelf_id, req.order_id)
-    if not lock_acquired:
-        raise HTTPException(status_code=409, detail=f"Shelf {shelf_id} is occupied. Race condition detected.")
+    # Acquire distributed lock
+    if _redis_client:
+        lock_key = f"shelf_lock:{tenant_id}:{shelf_id}"
+        acquired = await _redis_client.client.set(lock_key, order_id, nx=True, ex=ttl_seconds)
+        if not acquired:
+            raise HTTPException(status_code=409, detail="Shelf lock acquisition failed")
 
-    success = ttl_engine.assign_order(shelf_id, req.order_id)
-    if not success:
-        await release_shelf_lock(shelf_id, req.order_id)
-        raise HTTPException(status_code=409, detail="Shelf assignment failed")
+    # Update shelf slot
+    slot.status = "OCCUPIED"
+    slot.order_id = uuid.UUID(order_id)
+    slot.ttl_seconds = ttl_seconds
+    slot.assigned_at = datetime.now(timezone.utc)
+    await session.commit()
 
-    await set_shelf_status(shelf_id, {
-        "status": "OCCUPIED", "order_id": req.order_id,
-        "kitchen_id": req.kitchen_id, "assigned_at": time.time(),
-        "ttl_seconds": ttl_engine.shelves[shelf_id].ttl_seconds,
-    })
+    # Create assignment record
+    assignment = ShelfAssignmentModel(
+        tenant_id=uuid.UUID(tenant_id),
+        order_id=uuid.UUID(order_id),
+        kitchen_id=uuid.UUID(kitchen_id),
+        shelf_id=shelf_id,
+        zone=zone,
+        ttl_seconds=ttl_seconds,
+        ttl_remaining=ttl_seconds,
+    )
+    session.add(assignment)
+    await session.commit()
 
-    # Emit shelf.assigned Kafka event
-    emit_shelf_event("assigned", {
-        "shelf_id": shelf_id,
-        "order_id": req.order_id,
-        "kitchen_id": req.kitchen_id,
-        "zone": ttl_engine.shelves[shelf_id].temperature_zone,
-        "ttl_seconds": ttl_engine.shelves[shelf_id].ttl_seconds,
-        "assigned_at": time.time(),
-    })
+    # Set TTL tracking
+    if _redis_client:
+        ttl_engine = TTLEngine(_redis_client)
+        await ttl_engine.assign_shelf_ttl(shelf_id, order_id, zone, kitchen_id, tenant_id)
 
     return {
-        "shelf_id": shelf_id, "order_id": req.order_id,
-        "zone": ttl_engine.shelves[shelf_id].temperature_zone,
-        "ttl_seconds": ttl_engine.shelves[shelf_id].ttl_seconds, "status": "OCCUPIED",
+        "shelf_id": shelf_id,
+        "order_id": order_id,
+        "zone": zone,
+        "ttl_seconds": ttl_seconds,
+        "assigned": True,
     }
 
 
 @router.post("/{shelf_id}/release")
-async def release_shelf(shelf_id: str, req: ShelfReleaseRequest):
-    """Release a shelf slot after order pickup."""
-    released = await release_shelf_lock(shelf_id, req.order_id)
-    if not released:
-        raise HTTPException(status_code=409, detail="Lock release failed. Not the owner.")
-    order_id = ttl_engine.release_shelf(shelf_id)
-    if not order_id:
-        raise HTTPException(status_code=404, detail="Shelf not found or already available")
-    await set_shelf_status(shelf_id, {"status": "AVAILABLE", "order_id": None})
+async def release_shelf(
+    shelf_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Release a shelf slot."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-    # Emit shelf.released Kafka event
-    emit_shelf_event("released", {
-        "shelf_id": shelf_id,
-        "order_id": req.order_id,
-        "released_at": time.time(),
-    })
+    result = await session.execute(
+        select(ShelfSlotModel).where(ShelfSlotModel.id == shelf_id)
+    )
+    slot = result.scalar_one_or_none()
+    if not slot:
+        raise HTTPException(status_code=404, detail="Shelf not found")
 
-    return {"shelf_id": shelf_id, "order_id": order_id, "status": "AVAILABLE"}
+    # Release distributed lock
+    if _redis_client:
+        lock_key = f"shelf_lock:{tenant_id}:{shelf_id}"
+        await _redis_client.client.delete(lock_key)
 
+    order_id = str(slot.order_id) if slot.order_id else None
+    slot.status = "AVAILABLE"
+    slot.order_id = None
+    slot.released_at = datetime.now(timezone.utc)
+    await session.commit()
 
-@router.get("/{kitchen_id}/status")
-async def get_kitchen_shelves(kitchen_id: str):
-    """Get all shelf statuses for a kitchen."""
-    shelves = []
-    for shelf_id, shelf in ttl_engine.shelves.items():
-        if shelf.kitchen_id != kitchen_id:
-            continue
-        redis_ttl = await get_shelf_ttl(shelf_id)
-        shelves.append({"shelf_id": shelf.shelf_id, "zone": shelf.temperature_zone, "status": shelf.status, "order_id": shelf.current_order_id, "remaining_ttl": shelf.remaining_ttl, "redis_ttl": redis_ttl})
-    return {"kitchen_id": kitchen_id, "shelves": shelves}
+    return {"shelf_id": shelf_id, "released": True, "order_id": order_id}
 
 
-@router.get("/{kitchen_id}/warnings")
-async def get_expiry_warnings(kitchen_id: str):
-    """Get shelf TTL expiry warnings for a kitchen."""
-    warnings = ttl_engine.check_expiry_warnings(kitchen_id)
-    expired = ttl_engine.process_expired(kitchen_id)
+@router.post("/{shelf_id}/extend-ttl")
+async def extend_ttl(
+    shelf_id: str,
+    additional_seconds: int = 300,
+    user: dict = Depends(require_role("vendor_admin")),
+):
+    """Extend shelf TTL (warm station extension)."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-    # Emit shelf.expired Kafka events for each expired order
-    for exp in expired:
-        emit_shelf_event("expired", {
-            "shelf_id": exp["shelf_id"],
-            "order_id": exp["order_id"],
-            "kitchen_id": kitchen_id,
-            "ttl_exceeded_by": exp["ttl_exceeded_by"],
-        })
+    if not _redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
 
-    return {"warnings": warnings, "expired": expired, "total_warnings": len(warnings), "total_expired": len(expired)}
+    ttl_engine = TTLEngine(_redis_client)
+    extended = await ttl_engine.extend_ttl(shelf_id, tenant_id, additional_seconds)
+
+    if not extended:
+        raise HTTPException(status_code=404, detail="Shelf TTL not found")
+
+    return {"shelf_id": shelf_id, "extended_by": additional_seconds, "extended": True}
 
 
-@router.post("/{kitchen_id}/init")
-async def init_kitchen_shelves(kitchen_id: str, count: int = 10, zone: str = "HOT"):
-    """Initialize shelf slots for a kitchen."""
-    for i in range(1, count + 1):
-        shelf_id = f"{kitchen_id}-A{i}"
-        ttl_engine.register_shelf(shelf_id, kitchen_id, zone)
-        await set_shelf_status(shelf_id, {"status": "AVAILABLE", "kitchen_id": kitchen_id, "zone": zone})
-    return {"kitchen_id": kitchen_id, "shelves_created": count, "zone": zone}
+@router.get("/{shelf_id}/status")
+async def get_shelf_status(
+    shelf_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Get shelf TTL status."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    if not _redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+
+    ttl_engine = TTLEngine(_redis_client)
+    status = await ttl_engine.check_shelf_status(shelf_id, tenant_id)
+
+    if not status:
+        raise HTTPException(status_code=404, detail="Shelf status not found")
+
+    return status
+
+
+@router.get("/kitchen/{kitchen_id}/expired")
+async def get_expired_shelves(
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Get all expired shelves for a kitchen."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    if not _redis_client:
+        raise HTTPException(status_code=503, detail="Redis not available")
+
+    ttl_engine = TTLEngine(_redis_client)
+    expired = await ttl_engine.get_expired_shelves(kitchen_id, tenant_id)
+
+    return {"kitchen_id": kitchen_id, "expired_shelves": expired}

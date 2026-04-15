@@ -1,1 +1,0 @@
-"""HotSot Realtime Service — Routes."""

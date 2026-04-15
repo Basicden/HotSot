@@ -1,122 +1,78 @@
-"""HotSot Kitchen Service — Kitchen Routes."""
+"""HotSot Kitchen Service — Kitchen Management Routes."""
 
-import time
-from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Depends
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, List, Dict
+
+from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update, func
 
-from app.core.database import get_session, KitchenModel
-from app.core.engine import KitchenEngine, KitchenOrder, kitchen_engine
-from app.core.redis_client import get_kitchen_load, set_kitchen_load
+from shared.auth.jwt import get_current_user, require_role
+from shared.utils.database import get_session_factory
+from shared.utils.helpers import now_iso, generate_id
+from shared.types.schemas import EventType
+
+from app.core.database import (
+    KitchenModel, KitchenQueueModel, KitchenStaffModel, KitchenThroughputModel,
+)
+from app.core.engine import ThroughputMonitor, StaffAssignmentEngine
 
 router = APIRouter()
+_session_factory = None
+_redis_client = None
 
 
-@router.post("/{kitchen_id}/enqueue")
-async def enqueue_order(
-    kitchen_id: str,
-    order_id: str,
-    complexity: int = 1,
-    station_type: str = "default",
-    user_tier: int = 0,
-):
-    """Add an order to the kitchen queue with priority scoring."""
-    if kitchen_engine.is_critical(kitchen_id):
-        raise HTTPException(status_code=429, detail="Kitchen critically overloaded. Order throttled.")
-
-    order = KitchenOrder(
-        order_id=order_id,
-        kitchen_id=kitchen_id,
-        prep_complexity=complexity,
-        station_type=station_type,
-        user_tier=user_tier,
-        delay_risk=0.0,
-        eta_deadline=time.time() + 600,  # 10 min default
-    )
-
-    kitchen_engine.enqueue(order)
-
-    # Update load in Redis
-    load = kitchen_engine.get_queue_depth(kitchen_id)
-    await set_kitchen_load(kitchen_id, load)
-
-    return {
-        "order_id": order_id,
-        "kitchen_id": kitchen_id,
-        "priority_score": kitchen_engine.priority_score(order),
-        "queue_depth": load,
-        "status": "QUEUED",
-    }
+def set_dependencies(session_factory, redis_client):
+    """Set shared dependencies."""
+    global _session_factory, _redis_client
+    _session_factory = session_factory
+    _redis_client = redis_client
 
 
-@router.get("/{kitchen_id}/next")
-async def get_next_order(kitchen_id: str):
-    """Get the next highest-priority order for kitchen to prepare."""
-    order = kitchen_engine.dequeue(kitchen_id)
-    if not order:
-        return {"order_id": None, "status": "QUEUE_EMPTY"}
-
-    load = kitchen_engine.get_queue_depth(kitchen_id)
-    await set_kitchen_load(kitchen_id, load)
-
-    return {
-        "order_id": order.order_id,
-        "priority_score": kitchen_engine.priority_score(order),
-        "complexity": order.prep_complexity,
-        "station_type": order.station_type,
-        "remaining_queue": load,
-    }
+async def get_session():
+    """Get async database session."""
+    if _session_factory is None:
+        raise RuntimeError("Session factory not initialized")
+    async with _session_factory() as session:
+        yield session
 
 
-@router.get("/{kitchen_id}/status")
-async def get_kitchen_status(kitchen_id: str):
-    """Get kitchen status including load, overload, and batch suggestions."""
-    load = kitchen_engine.get_queue_depth(kitchen_id)
-    redis_load = await get_kitchen_load(kitchen_id)
-
-    return {
-        "kitchen_id": kitchen_id,
-        "queue_depth": load,
-        "redis_load": redis_load,
-        "is_overloaded": kitchen_engine.is_overloaded(kitchen_id),
-        "is_critical": kitchen_engine.is_critical(kitchen_id),
-        "suggested_batches": [
-            [{"order_id": o.order_id, "complexity": o.prep_complexity} for o in batch]
-            for batch in kitchen_engine.suggest_batches(kitchen_id)
-        ],
-    }
-
-
-@router.get("/{kitchen_id}/batches")
-async def get_batch_suggestions(kitchen_id: str):
-    """Get smart batch suggestions for efficient cooking."""
-    batches = kitchen_engine.suggest_batches(kitchen_id)
-    return {
-        "kitchen_id": kitchen_id,
-        "batch_count": len(batches),
-        "batches": [
-            {
-                "batch_id": i,
-                "station_type": batch[0].station_type if batch else None,
-                "orders": [
-                    {"order_id": o.order_id, "complexity": o.prep_complexity}
-                    for o in batch
-                ],
-            }
-            for i, batch in enumerate(batches)
-        ],
-    }
-
+# ═══════════════════════════════════════════════════════════════
+# KITCHEN CRUD
+# ═══════════════════════════════════════════════════════════════
 
 @router.post("/")
-async def create_kitchen(
+async def register_kitchen(
     name: str,
-    capacity: int = 20,
+    vendor_id: str,
+    location: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    max_concurrent_orders: int = 20,
+    staff_count: int = 3,
+    size: str = "medium",
+    fssai_license: Optional[str] = None,
+    gstin: Optional[str] = None,
+    user: dict = Depends(require_role("vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Register a new kitchen in the system."""
-    kitchen = KitchenModel(name=name, capacity=capacity)
+    """Register a new kitchen (cloud kitchen entity)."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    kitchen = KitchenModel(
+        tenant_id=uuid.UUID(tenant_id),
+        vendor_id=uuid.UUID(vendor_id),
+        name=name,
+        location=location,
+        lat=lat,
+        lng=lng,
+        max_concurrent_orders=max_concurrent_orders,
+        staff_count=staff_count,
+        size=size,
+        fssai_license=fssai_license,
+        gstin=gstin,
+    )
     session.add(kitchen)
     await session.commit()
     await session.refresh(kitchen)
@@ -124,5 +80,247 @@ async def create_kitchen(
     return {
         "kitchen_id": str(kitchen.id),
         "name": kitchen.name,
-        "capacity": kitchen.capacity,
+        "size": kitchen.size,
+        "max_concurrent_orders": kitchen.max_concurrent_orders,
+        "is_active": kitchen.is_active,
+        "created_at": kitchen.created_at.isoformat() if kitchen.created_at else None,
+    }
+
+
+@router.get("/{kitchen_id}")
+async def get_kitchen(
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get kitchen details."""
+    result = await session.execute(
+        select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
+    )
+    kitchen = result.scalar_one_or_none()
+    if not kitchen:
+        raise HTTPException(status_code=404, detail="Kitchen not found")
+
+    return {
+        "kitchen_id": str(kitchen.id),
+        "vendor_id": str(kitchen.vendor_id),
+        "name": kitchen.name,
+        "location": kitchen.location,
+        "lat": kitchen.lat,
+        "lng": kitchen.lng,
+        "max_concurrent_orders": kitchen.max_concurrent_orders,
+        "staff_count": kitchen.staff_count,
+        "is_active": kitchen.is_active,
+        "size": kitchen.size,
+        "throughput_per_minute": kitchen.throughput_per_minute,
+        "fssai_license": kitchen.fssai_license,
+        "gstin": kitchen.gstin,
+    }
+
+
+@router.put("/{kitchen_id}")
+async def update_kitchen(
+    kitchen_id: str,
+    name: Optional[str] = None,
+    max_concurrent_orders: Optional[int] = None,
+    staff_count: Optional[int] = None,
+    is_active: Optional[bool] = None,
+    size: Optional[str] = None,
+    user: dict = Depends(require_role("vendor_admin")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Update kitchen details."""
+    result = await session.execute(
+        select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
+    )
+    kitchen = result.scalar_one_or_none()
+    if not kitchen:
+        raise HTTPException(status_code=404, detail="Kitchen not found")
+
+    if name is not None:
+        kitchen.name = name
+    if max_concurrent_orders is not None:
+        kitchen.max_concurrent_orders = max_concurrent_orders
+    if staff_count is not None:
+        kitchen.staff_count = staff_count
+    if is_active is not None:
+        kitchen.is_active = is_active
+    if size is not None:
+        kitchen.size = size
+
+    kitchen.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    return {"kitchen_id": str(kitchen.id), "updated": True}
+
+
+@router.get("/{kitchen_id}/load")
+async def get_kitchen_load(
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get current kitchen load metrics."""
+    # Active orders count
+    active_count = await session.execute(
+        select(func.count()).where(
+            KitchenQueueModel.kitchen_id == uuid.UUID(kitchen_id),
+            KitchenQueueModel.status.in_(["QUEUED", "IN_PREP"]),
+        )
+    )
+    active_orders = active_count.scalar() or 0
+
+    # Kitchen capacity
+    kitchen_result = await session.execute(
+        select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
+    )
+    kitchen = kitchen_result.scalar_one_or_none()
+    if not kitchen:
+        raise HTTPException(status_code=404, detail="Kitchen not found")
+
+    max_cap = kitchen.max_concurrent_orders
+    load_pct = (active_orders / max(max_cap, 1)) * 100
+
+    return {
+        "kitchen_id": kitchen_id,
+        "active_orders": active_orders,
+        "max_capacity": max_cap,
+        "load_percentage": round(load_pct, 2),
+        "is_overloaded": load_pct >= 85,
+        "size": kitchen.size,
+    }
+
+
+@router.get("/{kitchen_id}/throughput")
+async def get_kitchen_throughput(
+    kitchen_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get kitchen throughput metrics (latest 10 measurements)."""
+    result = await session.execute(
+        select(KitchenThroughputModel)
+        .where(KitchenThroughputModel.kitchen_id == uuid.UUID(kitchen_id))
+        .order_by(KitchenThroughputModel.measured_at.desc())
+        .limit(10)
+    )
+    measurements = result.scalars().all()
+
+    return {
+        "kitchen_id": kitchen_id,
+        "measurements": [
+            {
+                "orders_per_minute": m.orders_per_minute,
+                "active_orders": m.active_orders,
+                "queue_length": m.queue_length,
+                "load_percentage": m.load_percentage,
+                "is_overloaded": m.is_overloaded,
+                "measured_at": m.measured_at.isoformat() if m.measured_at else None,
+            }
+            for m in measurements
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# STAFF MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/{kitchen_id}/staff")
+async def add_staff(
+    kitchen_id: str,
+    staff_id: str,
+    name: str,
+    role: str = "CHEF",
+    user: dict = Depends(require_role("vendor_admin")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Add a staff member to a kitchen."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    staff = KitchenStaffModel(
+        tenant_id=uuid.UUID(tenant_id),
+        kitchen_id=uuid.UUID(kitchen_id),
+        staff_id=uuid.UUID(staff_id),
+        name=name,
+        role=role,
+        is_available=True,
+    )
+    session.add(staff)
+    await session.commit()
+
+    # Register in Redis for quick assignment
+    if _redis_client:
+        engine = StaffAssignmentEngine(_redis_client)
+        await engine.register_staff(kitchen_id, staff_id, role, tenant_id)
+
+    return {"staff_id": staff_id, "name": name, "role": role, "added": True}
+
+
+@router.put("/{kitchen_id}/staff/{staff_id}/heartbeat")
+async def staff_heartbeat(
+    kitchen_id: str,
+    staff_id: str,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Staff heartbeat — confirms staff member is active."""
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    result = await session.execute(
+        select(KitchenStaffModel).where(
+            KitchenStaffModel.kitchen_id == uuid.UUID(kitchen_id),
+            KitchenStaffModel.staff_id == uuid.UUID(staff_id),
+        )
+    )
+    staff = result.scalar_one_or_none()
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    staff.last_heartbeat = datetime.now(timezone.utc)
+    await session.commit()
+
+    if _redis_client:
+        engine = StaffAssignmentEngine(_redis_client)
+        await engine.heartbeat(kitchen_id, staff_id, tenant_id)
+
+    return {"staff_id": staff_id, "heartbeat_received": True}
+
+
+@router.post("/{kitchen_id}/ack-order/{order_id}")
+async def ack_order(
+    kitchen_id: str,
+    order_id: str,
+    staff_id: str = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Staff ACK order — required before prep starts.
+
+    V2 design: kitchen must acknowledge receipt of order within 60s.
+    If not ACK'd, system escalates automatically.
+    """
+    result = await session.execute(
+        select(KitchenQueueModel).where(
+            KitchenQueueModel.kitchen_id == uuid.UUID(kitchen_id),
+            KitchenQueueModel.order_id == uuid.UUID(order_id),
+            KitchenQueueModel.status == "QUEUED",
+        )
+    )
+    queue_entry = result.scalar_one_or_none()
+    if not queue_entry:
+        raise HTTPException(status_code=404, detail="Order not in kitchen queue")
+
+    queue_entry.status = "IN_PREP"
+    queue_entry.started_at = datetime.now(timezone.utc)
+    if staff_id:
+        queue_entry.staff_id = uuid.UUID(staff_id)
+    await session.commit()
+
+    return {
+        "order_id": order_id,
+        "kitchen_id": kitchen_id,
+        "ack": True,
+        "status": "IN_PREP",
+        "staff_id": staff_id,
     }

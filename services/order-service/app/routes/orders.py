@@ -1,4 +1,5 @@
-"""HotSot Order Service — V2 Production-Grade Order Routes.
+"""
+HotSot Order Service — Complete V2 Order Routes.
 
 V2 Flow: CREATED → PAYMENT_PENDING → PAYMENT_CONFIRMED → SLOT_RESERVED →
 QUEUE_ASSIGNED → IN_PREP → PACKING → READY → ON_SHELF → ARRIVED →
@@ -6,578 +7,235 @@ HANDOFF_IN_PROGRESS → PICKED
 
 Plus failure paths: EXPIRED, REFUNDED, CANCELLED, FAILED
 
-Idempotency: Every mutation requires idempotency_key
-Event Sourcing: Every state change emits a canonical event
-Guard Rules: Critical transitions validated with context
+All mutations require idempotency_key.
+All routes require auth (JWT).
+All routes are tenant-scoped (tenant_id from JWT).
+All events published to Kafka via EventEnvelope.
 """
 
-import uuid
+from __future__ import annotations
+
 import hashlib
+import logging
 import time
+import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
 
-from app.core.database import get_session, OrderModel, OrderEventModel
-from app.core.schemas import (
-    OrderCreateRequest,
-    PaymentInitRequest,
-    PaymentConfirmRequest,
-    ArrivalRequest,
-    HandoffConfirmRequest,
-    CancelRequest,
-    OrderResponse,
-    EventLogResponse,
-    OrderStatus,
+from shared.auth.jwt import get_current_user, require_tenant
+from shared.types.schemas import (
+    EventEnvelope,
     EventType,
+    OrderStatus,
     UserTier,
     QueueType,
     ShelfZone,
+    RiskLevel,
+    OrderCreateRequest,
+    OrderResponse,
+    PaymentConfirmRequest,
+    HandoffConfirmRequest,
+    CancelRequest,
+    EventLogResponse,
+    KAFKA_TOPICS,
+    TIER_WEIGHTS,
+    SHELF_TTL_SECONDS,
 )
+from shared.utils.database import get_session_factory, set_tenant_id
+from shared.utils.helpers import (
+    generate_id,
+    now_iso,
+    idempotency_key,
+    items_hash,
+    arrival_dedup_key,
+)
+
+from app.core.database import OrderModel, OrderEventModel
 from app.core.state_machine import state_machine, InvalidTransitionError, GuardViolationError
-from app.core.events import Event, emit_event
-from app.core.redis_client import (
-    set_order_state,
-    get_order_state,
-    increment_kitchen_load,
-    decrement_kitchen_load,
-    get_kitchen_load,
-    check_idempotency_key,
-    store_idempotency_key,
-    acquire_lock,
-    release_lock,
-)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Maximum orders per kitchen before throttle
+# ─── Constants ───
 MAX_KITCHEN_ORDERS = 200
-# Shelf slot count per kitchen
 SHELF_SLOTS_PER_KITCHEN = 6
-# Shelf TTL default
 DEFAULT_SHELF_TTL = 600
-# Warm station TTL extension
 WARM_STATION_TTL_EXTENSION = 300
 
 
-# ─── IDEMPOTENCY HELPER ───
-async def enforce_idempotency(key: Optional[str]) -> Optional[Dict]:
-    """Check if this request was already processed. Return cached response if so."""
-    if not key:
-        return None
-    cached = await check_idempotency_key(key)
-    if cached:
-        return cached
-    return None
+# ═══════════════════════════════════════════════════════════════
+# PYDANTIC REQUEST MODELS (additional to shared schemas)
+# ═══════════════════════════════════════════════════════════════
+
+class AssignQueueRequest(BaseModel):
+    idempotency_key: Optional[str] = None
 
 
-async def mark_idempotent(key: Optional[str], response: Dict):
-    """Mark request as processed for idempotency."""
-    if key:
-        await store_idempotency_key(key, response, ttl=86400)  # 24h TTL
+class StartPrepRequest(BaseModel):
+    staff_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
-# ─── HELPER: Persist Event ───
+class MarkReadyRequest(BaseModel):
+    staff_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class AssignShelfRequest(BaseModel):
+    shelf_id: Optional[str] = None
+    zone: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class ArrivalRequestLocal(BaseModel):
+    user_id: str
+    latitude: float = 0.0
+    longitude: float = 0.0
+    qr_scan: bool = False
+    idempotency_key: Optional[str] = None
+
+
+class ExpireRequest(BaseModel):
+    reason: str = "SHELF_TTL_EXCEEDED"
+    idempotency_key: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════
+
+async def get_db():
+    """Database session dependency with tenant isolation."""
+    session_factory = get_session_factory("order")
+    async with session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def get_kafka_producer(request: Request):
+    """Get the Kafka producer from app state."""
+    return request.app.state.kafka_producer
+
+
+async def get_redis(request: Request):
+    """Get the Redis client from app state."""
+    return request.app.state.redis_client
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
 async def persist_event(
     session: AsyncSession,
     order_id: str,
+    tenant_id: str,
     event_type: str,
     payload: dict = None,
-    sequence_number: int = 0,
     source: str = "order-service",
-):
-    """Save event to database for audit trail with sequence tracking."""
+    idempotency_key_val: Optional[str] = None,
+    sequence_number: int = 0,
+) -> OrderEventModel:
+    """Save event to database for audit trail."""
     event_record = OrderEventModel(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
         order_id=uuid.UUID(order_id),
         event_type=event_type,
         payload=payload or {},
         source=source,
+        idempotency_key=idempotency_key_val,
+        sequence_number=sequence_number,
     )
     session.add(event_record)
     await session.flush()
+    return event_record
 
 
-# ─── HELPER: Format Order Response ───
+async def publish_event(
+    producer,
+    event_type: EventType,
+    order_id: str,
+    tenant_id: str,
+    payload: dict,
+    kitchen_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    idempotency_key_val: Optional[str] = None,
+) -> bool:
+    """Publish an event to Kafka via EventEnvelope."""
+    if not producer:
+        logger.warning("Kafka producer not available — event not published")
+        return False
+
+    envelope = EventEnvelope(
+        event_id=generate_id(),
+        event_type=event_type,
+        order_id=order_id,
+        kitchen_id=kitchen_id,
+        tenant_id=tenant_id,
+        idempotency_key=idempotency_key_val,
+        source="order-service",
+        timestamp=now_iso(),
+        schema_version=2,
+        payload=payload,
+        correlation_id=correlation_id,
+    )
+
+    return await producer.publish_event(envelope)
+
+
+async def check_idempotency(redis_client, key: Optional[str]) -> Optional[Dict]:
+    """Check if this request was already processed."""
+    if not key or not redis_client:
+        return None
+    cached = await redis_client.cache_get(key, prefix="idempotency")
+    return cached
+
+
+async def store_idempotency(redis_client, key: Optional[str], response: Dict) -> None:
+    """Mark request as processed for idempotency."""
+    if not key or not redis_client:
+        return
+    await redis_client.cache_set(key, response, ttl=86400, prefix="idempotency")
+
+
 def format_order(order: OrderModel) -> dict:
     """Convert ORM model to API response with V2 fields."""
     return {
         "order_id": str(order.id),
         "user_id": str(order.user_id),
         "kitchen_id": str(order.kitchen_id),
+        "tenant_id": order.tenant_id,
         "status": order.status,
-        "queue_type": getattr(order, "queue_type", None),
-        "queue_position": getattr(order, "queue_position", None),
-        "priority_score": getattr(order, "priority_score", None),
+        "queue_type": order.queue_type,
+        "queue_position": order.queue_position,
+        "priority_score": order.priority_score,
         "eta_seconds": order.eta_seconds,
         "eta_confidence": order.eta_confidence,
         "eta_risk": order.eta_risk,
         "shelf_id": order.shelf_id,
-        "shelf_zone": getattr(order, "shelf_zone", None),
+        "shelf_zone": order.shelf_zone,
+        "shelf_ttl_remaining": order.shelf_ttl_remaining,
         "payment_ref": order.payment_ref,
-        "batch_id": getattr(order, "batch_id", None),
-        "arrived_at": order.arrived_at.isoformat() if getattr(order, "arrived_at", None) else None,
-        "picked_at": order.picked_at.isoformat() if getattr(order, "picked_at", None) else None,
+        "payment_method": order.payment_method,
+        "batch_id": order.batch_id,
+        "user_tier": order.user_tier,
+        "arrived_at": order.arrived_at.isoformat() if order.arrived_at else None,
+        "picked_at": order.picked_at.isoformat() if order.picked_at else None,
+        "prep_started_at": order.prep_started_at.isoformat() if order.prep_started_at else None,
+        "ready_at": order.ready_at.isoformat() if order.ready_at else None,
         "created_at": order.created_at.isoformat() if order.created_at else None,
     }
-
-
-# ═══════════════════════════════════════════════════════════════
-# 1. CREATE ORDER (V2: CREATED → PAYMENT_PENDING)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/create", response_model=OrderResponse)
-async def create_order(
-    req: OrderCreateRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Create a new order. V2 flow: CREATED → PAYMENT_PENDING.
-    
-    - Validates kitchen capacity via Redis
-    - Stores idempotency_key for dedup
-    - Emits ORDER_CREATED event
-    - Transitions to PAYMENT_PENDING (waits for payment before slot)
-    """
-    # Idempotency check
-    cached = await enforce_idempotency(req.idempotency_key)
-    if cached:
-        return cached
-
-    # Check kitchen capacity
-    kitchen_load = await get_kitchen_load(req.kitchen_id)
-    if kitchen_load >= MAX_KITCHEN_ORDERS:
-        raise HTTPException(
-            status_code=429,
-            detail="Kitchen at capacity. Try again shortly."
-        )
-
-    # Create order in Postgres
-    order = OrderModel(
-        user_id=uuid.UUID(req.user_id),
-        kitchen_id=uuid.UUID(req.kitchen_id),
-        status=OrderStatus.CREATED,
-        items=req.items,
-        total_amount=req.total_amount,
-        payment_method=req.payment_method,
-        user_tier=req.user_tier.value,
-    )
-    session.add(order)
-    await session.flush()
-
-    order_id = str(order.id)
-
-    # Emit ORDER_CREATED event
-    await persist_event(session, order_id, "ORDER_CREATED", {
-        "user_id": req.user_id,
-        "kitchen_id": req.kitchen_id,
-        "items_count": len(req.items),
-        "user_tier": req.user_tier.value,
-        "payment_method": req.payment_method,
-    })
-
-    # V2: Transition to PAYMENT_PENDING (not SLOT_RESERVED)
-    try:
-        new_status = state_machine.transition("CREATED", "PAYMENT_PENDING")
-        order.status = new_status
-        await persist_event(session, order_id, "PAYMENT_PENDING", {
-            "payment_method": req.payment_method,
-        })
-    except InvalidTransitionError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    await session.commit()
-    await session.refresh(order)
-
-    # Update Redis hot state
-    await set_order_state(order_id, {
-        "status": order.status,
-        "kitchen_id": req.kitchen_id,
-        "user_id": req.user_id,
-        "user_tier": req.user_tier.value,
-    })
-
-    # Emit async events
-    await emit_event(Event(order_id, "ORDER_CREATED", {
-        "user_id": req.user_id,
-        "kitchen_id": req.kitchen_id,
-        "items": req.items,
-        "user_tier": req.user_tier.value,
-    }))
-    await emit_event(Event(order_id, "PAYMENT_PENDING", {
-        "payment_method": req.payment_method,
-    }))
-
-    response = format_order(order)
-    await mark_idempotent(req.idempotency_key, response)
-    return response
-
-
-# ═══════════════════════════════════════════════════════════════
-# 2. CONFIRM PAYMENT (V2: PAYMENT_PENDING → PAYMENT_CONFIRMED → SLOT_RESERVED)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/pay", response_model=OrderResponse)
-async def confirm_payment(
-    order_id: str,
-    req: PaymentConfirmRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Confirm payment for an order.
-    
-    V2 Flow: PAYMENT_PENDING → PAYMENT_CONFIRMED → SLOT_RESERVED
-    - Validates payment reference (UPI gateway simulation)
-    - Reserves slot AFTER payment (V2 correction)
-    - Emits PAYMENT_CONFIRMED and SLOT_RESERVED events
-    """
-    # Idempotency check
-    cached = await enforce_idempotency(req.idempotency_key)
-    if cached:
-        return cached
-
-    # Fetch order
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
-    )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    # Validate current state
-    if order.status != "PAYMENT_PENDING":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot pay: order is {order.status} (expected PAYMENT_PENDING)"
-        )
-
-    # Transition: PAYMENT_PENDING → PAYMENT_CONFIRMED
-    try:
-        order.status = state_machine.transition("PAYMENT_PENDING", "PAYMENT_CONFIRMED")
-        order.payment_ref = req.payment_ref
-        await persist_event(session, order_id, "PAYMENT_CONFIRMED", {
-            "payment_ref": req.payment_ref,
-            "payment_method": req.payment_method,
-            "gateway_txn_id": req.gateway_txn_id,
-        })
-    except InvalidTransitionError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    # V2: Slot reservation AFTER payment
-    kitchen_load = await get_kitchen_load(str(order.kitchen_id))
-    kitchen_load_pct = (kitchen_load / MAX_KITCHEN_ORDERS) * 100
-
-    slot_context = {
-        "slot_available": kitchen_load < MAX_KITCHEN_ORDERS,
-        "waitlist_allowed": True,  # Allow waitlist as fallback
-    }
-
-    try:
-        order.status = state_machine.transition(
-            "PAYMENT_CONFIRMED", "SLOT_RESERVED", context=slot_context
-        )
-        await increment_kitchen_load(str(order.kitchen_id))
-        await persist_event(session, order_id, "SLOT_RESERVED", {
-            "kitchen_load_pct": kitchen_load_pct,
-            "slot_available": True,
-        })
-    except (InvalidTransitionError, GuardViolationError) as e:
-        # Slot conflict — payment succeeded but no slot
-        # Lock payment result and trigger re-slot negotiation
-        await persist_event(session, order_id, "SLOT_CONFLICT", {
-            "payment_ref": req.payment_ref,
-            "kitchen_load": kitchen_load,
-        })
-        await emit_event(Event(order_id, "SLOT_FILLED", {
-            "payment_ref": req.payment_ref,
-            "fallback": "waitlist",
-        }))
-        # Keep in PAYMENT_CONFIRMED — user must choose next slot
-        await session.commit()
-        raise HTTPException(
-            status_code=409,
-            detail="Slot filled during payment. Please select a new time slot."
-        )
-
-    await session.commit()
-    await session.refresh(order)
-
-    # Update Redis + emit events
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "PAYMENT_CONFIRMED", {
-        "payment_ref": req.payment_ref,
-    }))
-    await emit_event(Event(order_id, "SLOT_RESERVED", {
-        "kitchen_id": str(order.kitchen_id),
-    }))
-
-    response = format_order(order)
-    await mark_idempotent(req.idempotency_key, response)
-    return response
-
-
-# ═══════════════════════════════════════════════════════════════
-# 3. ASSIGN QUEUE (V2: SLOT_RESERVED → QUEUE_ASSIGNED)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/assign-queue", response_model=OrderResponse)
-async def assign_queue(
-    order_id: str,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Assign order to kitchen queue after slot reservation.
-    
-    V2 Flow: SLOT_RESERVED → QUEUE_ASSIGNED
-    - Computes priority score
-    - Determines queue type (IMMEDIATE / NORMAL / BATCH)
-    - Assigns queue position
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
-    )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if order.status != "SLOT_RESERVED":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot assign queue: order is {order.status}"
-        )
-
-    # Compute priority score (simplified — full engine in kitchen-service)
-    user_tier = getattr(order, "user_tier", "FREE")
-    tier_weight = {"FREE": 1, "PLUS": 2, "PRO": 3, "VIP": 4}.get(user_tier, 1)
-    priority_score = 50.0 + (tier_weight * 5)
-
-    # Determine queue type based on priority
-    if priority_score > 80:
-        queue_type = QueueType.IMMEDIATE.value
-    elif priority_score >= 60:
-        queue_type = QueueType.NORMAL.value
-    else:
-        queue_type = QueueType.BATCH.value
-
-    # Transition with guard
-    context = {"priority_score": priority_score}
-    try:
-        order.status = state_machine.transition(
-            "SLOT_RESERVED", "QUEUE_ASSIGNED", context=context
-        )
-        setattr(order, "queue_type", queue_type)
-        setattr(order, "priority_score", priority_score)
-        await persist_event(session, order_id, "QUEUE_ASSIGNED", {
-            "queue_type": queue_type,
-            "priority_score": priority_score,
-        })
-    except (InvalidTransitionError, GuardViolationError) as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {
-        "status": order.status,
-        "queue_type": queue_type,
-        "priority_score": priority_score,
-    })
-    await emit_event(Event(order_id, "QUEUE_ASSIGNED", {
-        "queue_type": queue_type,
-        "priority_score": priority_score,
-    }))
-
-    return format_order(order)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 4. START PREP (V2: QUEUE_ASSIGNED/BATCH_WAIT → IN_PREP)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/start-prep", response_model=OrderResponse)
-async def start_prep(
-    order_id: str,
-    staff_id: str = None,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Kitchen staff acknowledges and starts preparation.
-    
-    V2 Flow: QUEUE_ASSIGNED → IN_PREP (or BATCH_WAIT → IN_PREP)
-    - Requires staff ACK (forced interaction per V2 design)
-    - If not ACK'd within 60s, system escalates automatically
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
-    )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if order.status not in ["QUEUE_ASSIGNED", "BATCH_WAIT"]:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot start prep: order is {order.status}"
-        )
-
-    try:
-        order.status = state_machine.transition(order.status, "IN_PREP")
-        order.prep_started_at = datetime.now(timezone.utc)
-        await persist_event(session, order_id, "PREP_STARTED", {
-            "staff_id": staff_id,
-            "from_state": order.status,
-        })
-    except InvalidTransitionError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "PREP_STARTED", {
-        "staff_id": staff_id,
-        "kitchen_id": str(order.kitchen_id),
-    }))
-
-    return format_order(order)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 5. COMPLETE PREP + PACKING (V2: IN_PREP → PACKING → READY)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/ready", response_model=OrderResponse)
-async def mark_ready(
-    order_id: str,
-    staff_id: str = None,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Mark order as ready for pickup after prep + packing.
-    
-    V2 Flow: IN_PREP → PACKING → READY
-    - Two-step: prep done → packing → ready
-    - Triggers shelf allocation via event
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
-    )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    # V2: Support both IN_PREP → PACKING and direct IN_PREP → READY for backwards compat
-    if order.status == "IN_PREP":
-        try:
-            order.status = state_machine.transition("IN_PREP", "PACKING")
-            await persist_event(session, order_id, "PACKING_STARTED", {
-                "staff_id": staff_id,
-            })
-            await emit_event(Event(order_id, "PREP_COMPLETED", {}))
-        except InvalidTransitionError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-
-    if order.status == "PACKING":
-        try:
-            order.status = state_machine.transition("PACKING", "READY")
-            order.ready_at = datetime.now(timezone.utc)
-            await persist_event(session, order_id, "READY_FOR_PICKUP", {
-                "staff_id": staff_id,
-            })
-        except InvalidTransitionError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "READY_FOR_PICKUP", {}))
-
-    return format_order(order)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 6. ASSIGN SHELF (V2: READY → ON_SHELF with guard)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/shelf", response_model=OrderResponse)
-async def assign_shelf(
-    order_id: str,
-    shelf_id: Optional[str] = None,
-    zone: Optional[str] = None,
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Assign order to a physical shelf slot for pickup.
-    
-    V2 Flow: READY → ON_SHELF
-    - Guard: shelf_id != null AND shelf_capacity > 0
-    - Uses Redis distributed lock for shelf allocation
-    - Zone-aware: HOT food → HOT zone, etc.
-    - TTL enforced per zone (HOT=600s, COLD=900s, AMBIENT=1200s)
-    - Overflow → HOLD_ZONE (virtual waitlist)
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
-    )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if order.status != "READY":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot assign shelf: order is {order.status}"
-        )
-
-    # Determine shelf zone based on items (simple heuristic)
-    if not zone:
-        zone = _determine_zone(order.items)
-
-    # Acquire shelf lock via Redis
-    if shelf_id:
-        lock_acquired = await acquire_lock(f"shelf:{shelf_id}", order_id, ttl=DEFAULT_SHELF_TTL)
-        if not lock_acquired:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Shelf {shelf_id} is occupied"
-            )
-    else:
-        # Auto-assign shelf with zone preference
-        shelf_id = await _auto_assign_shelf(str(order.kitchen_id), order_id, zone)
-        if not shelf_id:
-            # No shelf available → move to HOLD_ZONE (virtual waitlist)
-            shelf_id = "HOLD_ZONE"
-            zone = "AMBIENT"
-
-    # Transition with guard
-    ttl = {"HOT": 600, "COLD": 900, "AMBIENT": 1200}.get(zone, 600)
-    context = {"shelf_id": shelf_id, "shelf_capacity": 1 if shelf_id != "HOLD_ZONE" else 0}
-
-    try:
-        order.status = state_machine.transition("READY", "ON_SHELF", context=context)
-        order.shelf_id = shelf_id
-        setattr(order, "shelf_zone", zone)
-        setattr(order, "shelf_ttl_remaining", ttl)
-        await persist_event(session, order_id, "SHELF_ASSIGNED", {
-            "shelf_id": shelf_id,
-            "zone": zone,
-            "ttl_seconds": ttl,
-        })
-    except (InvalidTransitionError, GuardViolationError) as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {
-        "status": order.status,
-        "shelf_id": shelf_id,
-        "shelf_zone": zone,
-    })
-    await emit_event(Event(order_id, "SHELF_ASSIGNED", {
-        "shelf_id": shelf_id,
-        "zone": zone,
-        "ttl_seconds": ttl,
-    }))
-
-    return format_order(order)
 
 
 def _determine_zone(items: list) -> str:
@@ -595,46 +253,662 @@ def _determine_zone(items: list) -> str:
     return "HOT"
 
 
-async def _auto_assign_shelf(kitchen_id: str, order_id: str, zone: str = "HOT") -> Optional[str]:
+async def _auto_assign_shelf(
+    redis_client, kitchen_id: str, order_id: str, zone: str = "HOT"
+) -> Optional[str]:
     """Find and lock an available shelf slot with zone preference."""
+    if not redis_client:
+        return "H1"  # Fallback for dev
     for slot_num in range(1, SHELF_SLOTS_PER_KITCHEN + 1):
-        shelf_id = f"{zone[0]}{slot_num}"  # H1-H6, C1-C6, A1-A6
-        lock_acquired = await acquire_lock(f"shelf:{shelf_id}", order_id, ttl=DEFAULT_SHELF_TTL)
-        if lock_acquired:
+        shelf_id = f"{zone[0]}{slot_num}"
+        acquired = await redis_client.acquire_shelf_lock(
+            shelf_id, order_id, ttl=DEFAULT_SHELF_TTL, tenant_id="default"
+        )
+        if acquired:
             return shelf_id
     return None
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. CONFIRM ARRIVAL (V2: ON_SHELF → ARRIVED)
+# 1. CREATE ORDER (CREATED → PAYMENT_PENDING)
 # ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/arrival", response_model=OrderResponse)
-async def confirm_arrival(
-    order_id: str,
-    req: ArrivalRequest,
-    session: AsyncSession = Depends(get_session),
+@router.post("/create")
+async def create_order(
+    req: OrderCreateRequest,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
 ):
     """
-    User arrival detection via GPS or QR scan.
-    
-    V2 Flow: ON_SHELF → ARRIVED
-    - Guard: GPS distance ≤ 150m OR valid QR scan
-    - Idempotency: dedup by hash(user_id + order_id + floor(timestamp/30s))
-    - Arrival triggers priority boost (+20) for orders still in prep
-    - Staff UI highlights order with flash + audible ping
-    """
-    # Arrival dedup key
-    if not req.idempotency_key:
-        ts_bucket = int(time.time()) // 30  # 30-second window
-        dedup_raw = f"{req.user_id}:{order_id}:{ts_bucket}"
-        req.idempotency_key = hashlib.sha256(dedup_raw.encode()).hexdigest()
+    Create a new order. V2 flow: CREATED → PAYMENT_PENDING.
 
-    cached = await enforce_idempotency(req.idempotency_key)
+    - Validates kitchen capacity via Redis
+    - Stores idempotency_key for dedup
+    - Emits ORDER_CREATED event
+    - Transitions to PAYMENT_PENDING (waits for payment before slot)
+    """
+    tenant_id = user.get("tenant_id", req.tenant_id)
+
+    # Set tenant context for RLS
+    await set_tenant_id(session, tenant_id)
+
+    # Idempotency check
+    cached = await check_idempotency(redis_client, req.idempotency_key)
+    if cached:
+        return cached
+
+    # Check kitchen capacity
+    if redis_client:
+        kitchen_load_data = await redis_client.get_kitchen_load(req.kitchen_id, tenant_id)
+        kitchen_load = kitchen_load_data.get("active_orders", 0) if kitchen_load_data else 0
+    else:
+        kitchen_load = 0
+
+    if kitchen_load >= MAX_KITCHEN_ORDERS:
+        raise HTTPException(
+            status_code=429,
+            detail="Kitchen at capacity. Try again shortly.",
+        )
+
+    # Compute idempotency key if not provided
+    idem_key = req.idempotency_key or idempotency_key(
+        user_id=req.user_id,
+        kitchen_id=req.kitchen_id,
+        items_hash=items_hash(req.items) if req.items else "no-items",
+    )
+
+    # Create order in Postgres
+    order = OrderModel(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=uuid.UUID(req.user_id),
+        kitchen_id=uuid.UUID(req.kitchen_id),
+        status="CREATED",
+        items=req.items,
+        total_amount=req.total_amount,
+        payment_method=req.payment_method,
+        user_tier=req.user_tier.value,
+        idempotency_key=idem_key,
+    )
+    session.add(order)
+    await session.flush()
+
+    order_id = str(order.id)
+
+    # Emit ORDER_CREATED event
+    seq = 1
+    await persist_event(
+        session, order_id, tenant_id, EventType.ORDER_CREATED.value,
+        {
+            "user_id": req.user_id,
+            "kitchen_id": req.kitchen_id,
+            "items_count": len(req.items),
+            "user_tier": req.user_tier.value,
+            "payment_method": req.payment_method,
+        },
+        idempotency_key_val=idem_key,
+        sequence_number=seq,
+    )
+
+    # V2: Transition to PAYMENT_PENDING
+    try:
+        new_status = state_machine.transition("CREATED", "PAYMENT_PENDING")
+        order.status = new_status
+        seq += 1
+        await persist_event(
+            session, order_id, tenant_id, EventType.PAYMENT_PENDING.value,
+            {"payment_method": req.payment_method},
+            sequence_number=seq,
+        )
+    except InvalidTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    # Update Redis hot state
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    # Emit async events
+    await publish_event(
+        producer, EventType.ORDER_CREATED, order_id, tenant_id,
+        {
+            "user_id": req.user_id,
+            "kitchen_id": req.kitchen_id,
+            "items": req.items,
+            "user_tier": req.user_tier.value,
+        },
+        kitchen_id=req.kitchen_id,
+        idempotency_key_val=idem_key,
+    )
+    await publish_event(
+        producer, EventType.PAYMENT_PENDING, order_id, tenant_id,
+        {"payment_method": req.payment_method},
+        kitchen_id=req.kitchen_id,
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. INITIATE PAYMENT
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/pay")
+async def initiate_payment(
+    order_id: str,
+    req: PaymentConfirmRequest,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Initiate/confirm payment for an order. PAYMENT_PENDING → PAYMENT_CONFIRMED → SLOT_RESERVED."""
+    tenant_id = user.get("tenant_id", req.tenant_id)
+    await set_tenant_id(session, tenant_id)
+
+    cached = await check_idempotency(redis_client, req.idempotency_key)
     if cached:
         return cached
 
     result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status != "PAYMENT_PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot pay: order is {order.status} (expected PAYMENT_PENDING)",
+        )
+
+    # Transition: PAYMENT_PENDING → PAYMENT_CONFIRMED
+    try:
+        order.status = state_machine.transition("PAYMENT_PENDING", "PAYMENT_CONFIRMED")
+        order.payment_ref = req.payment_ref
+        await persist_event(
+            session, order_id, tenant_id, EventType.PAYMENT_CONFIRMED.value,
+            {
+                "payment_ref": req.payment_ref,
+                "payment_method": req.payment_method,
+                "gateway_txn_id": req.gateway_txn_id,
+            },
+            idempotency_key_val=req.idempotency_key,
+        )
+    except InvalidTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    # Slot reservation AFTER payment
+    kitchen_load = 0
+    if redis_client:
+        load_data = await redis_client.get_kitchen_load(str(order.kitchen_id), tenant_id)
+        kitchen_load = load_data.get("active_orders", 0) if load_data else 0
+
+    slot_context = {
+        "slot_available": kitchen_load < MAX_KITCHEN_ORDERS,
+        "waitlist_allowed": True,
+    }
+
+    try:
+        order.status = state_machine.transition(
+            "PAYMENT_CONFIRMED", "SLOT_RESERVED", context=slot_context
+        )
+        await persist_event(
+            session, order_id, tenant_id, EventType.SLOT_RESERVED.value,
+            {"kitchen_load": kitchen_load, "slot_available": True},
+        )
+    except (InvalidTransitionError, GuardViolationError) as e:
+        await persist_event(
+            session, order_id, tenant_id, "SLOT_CONFLICT",
+            {"payment_ref": req.payment_ref, "kitchen_load": kitchen_load},
+        )
+        await session.flush()
+        raise HTTPException(
+            status_code=409,
+            detail="Slot filled during payment. Please select a new time slot.",
+        )
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.PAYMENT_CONFIRMED, order_id, tenant_id,
+        {"payment_ref": req.payment_ref},
+        kitchen_id=str(order.kitchen_id),
+    )
+    await publish_event(
+        producer, EventType.SLOT_RESERVED, order_id, tenant_id,
+        {"kitchen_id": str(order.kitchen_id)},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, req.idempotency_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. CONFIRM PAYMENT (Webhook)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/confirm-payment")
+async def confirm_payment_webhook(
+    order_id: str,
+    req: PaymentConfirmRequest,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Confirm payment via webhook. PAYMENT_PENDING → PAYMENT_CONFIRMED."""
+    tenant_id = user.get("tenant_id", req.tenant_id)
+    await set_tenant_id(session, tenant_id)
+
+    cached = await check_idempotency(redis_client, req.idempotency_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status != "PAYMENT_PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot confirm payment: order is {order.status}",
+        )
+
+    try:
+        order.status = state_machine.transition("PAYMENT_PENDING", "PAYMENT_CONFIRMED")
+        order.payment_ref = req.payment_ref
+        await persist_event(
+            session, order_id, tenant_id, EventType.PAYMENT_CONFIRMED.value,
+            {
+                "payment_ref": req.payment_ref,
+                "gateway_txn_id": req.gateway_txn_id,
+            },
+            idempotency_key_val=req.idempotency_key,
+        )
+    except InvalidTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.PAYMENT_CONFIRMED, order_id, tenant_id,
+        {"payment_ref": req.payment_ref, "gateway_txn_id": req.gateway_txn_id},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, req.idempotency_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. ASSIGN QUEUE (SLOT_RESERVED → QUEUE_ASSIGNED)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/assign-queue")
+async def assign_queue(
+    order_id: str,
+    req: AssignQueueRequest = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Assign order to kitchen queue. SLOT_RESERVED → QUEUE_ASSIGNED."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    idem_key = req.idempotency_key if req else None
+    cached = await check_idempotency(redis_client, idem_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status != "SLOT_RESERVED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot assign queue: order is {order.status}",
+        )
+
+    # Compute priority score
+    tier_weight = TIER_WEIGHTS.get(order.user_tier, 1)
+    priority_score = 50.0 + (tier_weight * 5)
+
+    # Determine queue type
+    if priority_score > 80:
+        queue_type = QueueType.IMMEDIATE.value
+    elif priority_score >= 60:
+        queue_type = QueueType.NORMAL.value
+    else:
+        queue_type = QueueType.BATCH.value
+
+    # Transition with guard
+    context = {"priority_score": priority_score}
+    try:
+        order.status = state_machine.transition(
+            "SLOT_RESERVED", "QUEUE_ASSIGNED", context=context
+        )
+        order.queue_type = queue_type
+        order.priority_score = priority_score
+        await persist_event(
+            session, order_id, tenant_id, EventType.QUEUE_ASSIGNED.value,
+            {"queue_type": queue_type, "priority_score": priority_score},
+            idempotency_key_val=idem_key,
+        )
+    except (InvalidTransitionError, GuardViolationError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.QUEUE_ASSIGNED, order_id, tenant_id,
+        {"queue_type": queue_type, "priority_score": priority_score},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. START PREP (QUEUE_ASSIGNED/BATCH_WAIT → IN_PREP)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/start-prep")
+async def start_prep(
+    order_id: str,
+    req: StartPrepRequest = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Kitchen staff starts preparation. QUEUE_ASSIGNED → IN_PREP."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    idem_key = req.idempotency_key if req else None
+    cached = await check_idempotency(redis_client, idem_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status not in ("QUEUE_ASSIGNED", "BATCH_WAIT"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot start prep: order is {order.status}",
+        )
+
+    try:
+        order.status = state_machine.transition(order.status, "IN_PREP")
+        order.prep_started_at = datetime.now(timezone.utc)
+        staff_id = req.staff_id if req else None
+        await persist_event(
+            session, order_id, tenant_id, EventType.PREP_STARTED.value,
+            {"staff_id": staff_id, "from_state": order.status},
+            idempotency_key_val=idem_key,
+        )
+    except InvalidTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.PREP_STARTED, order_id, tenant_id,
+        {"staff_id": staff_id if req else None, "kitchen_id": str(order.kitchen_id)},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. MARK READY (IN_PREP → PACKING → READY)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/ready")
+async def mark_ready(
+    order_id: str,
+    req: MarkReadyRequest = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Mark order as ready for pickup. IN_PREP → PACKING → READY."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    idem_key = req.idempotency_key if req else None
+    cached = await check_idempotency(redis_client, idem_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    staff_id = req.staff_id if req else None
+
+    # IN_PREP → PACKING
+    if order.status == "IN_PREP":
+        try:
+            order.status = state_machine.transition("IN_PREP", "PACKING")
+            await persist_event(
+                session, order_id, tenant_id, EventType.PACKING_STARTED.value,
+                {"staff_id": staff_id},
+            )
+            await publish_event(
+                producer, EventType.PREP_COMPLETED, order_id, tenant_id,
+                {"kitchen_id": str(order.kitchen_id)},
+                kitchen_id=str(order.kitchen_id),
+            )
+        except InvalidTransitionError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    # PACKING → READY
+    if order.status == "PACKING":
+        try:
+            order.status = state_machine.transition("PACKING", "READY")
+            order.ready_at = datetime.now(timezone.utc)
+            await persist_event(
+                session, order_id, tenant_id, EventType.READY_FOR_PICKUP.value,
+                {"staff_id": staff_id},
+                idempotency_key_val=idem_key,
+            )
+        except InvalidTransitionError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.READY_FOR_PICKUP, order_id, tenant_id,
+        {"kitchen_id": str(order.kitchen_id)},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7. ASSIGN SHELF (READY → ON_SHELF)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/shelf")
+async def assign_shelf(
+    order_id: str,
+    req: AssignShelfRequest = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """Assign order to a physical shelf slot. READY → ON_SHELF."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    idem_key = req.idempotency_key if req else None
+    cached = await check_idempotency(redis_client, idem_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot assign shelf: order is {order.status}",
+        )
+
+    # Determine shelf zone
+    zone = (req.zone if req else None) or _determine_zone(order.items or [])
+
+    # Acquire shelf lock via Redis
+    shelf_id = None
+    if req and req.shelf_id:
+        if redis_client:
+            acquired = await redis_client.acquire_shelf_lock(
+                req.shelf_id, order_id, ttl=DEFAULT_SHELF_TTL, tenant_id=tenant_id
+            )
+            if not acquired:
+                raise HTTPException(status_code=409, detail=f"Shelf {req.shelf_id} is occupied")
+        shelf_id = req.shelf_id
+    else:
+        shelf_id = await _auto_assign_shelf(
+            redis_client, str(order.kitchen_id), order_id, zone
+        )
+        if not shelf_id:
+            shelf_id = "HOLD_ZONE"
+            zone = "AMBIENT"
+
+    # Transition with guard
+    ttl = SHELF_TTL_SECONDS.get(zone, 600)
+    context = {
+        "shelf_id": shelf_id,
+        "shelf_capacity": 1 if shelf_id != "HOLD_ZONE" else 0,
+    }
+
+    try:
+        order.status = state_machine.transition("READY", "ON_SHELF", context=context)
+        order.shelf_id = shelf_id
+        order.shelf_zone = zone
+        order.shelf_ttl_remaining = ttl
+        await persist_event(
+            session, order_id, tenant_id, EventType.SHELF_ASSIGNED.value,
+            {"shelf_id": shelf_id, "zone": zone, "ttl_seconds": ttl},
+            idempotency_key_val=idem_key,
+        )
+    except (InvalidTransitionError, GuardViolationError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    await session.flush()
+
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.SHELF_ASSIGNED, order_id, tenant_id,
+        {"shelf_id": shelf_id, "zone": zone, "ttl_seconds": ttl},
+        kitchen_id=str(order.kitchen_id),
+    )
+
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
+
+
+# ═══════════════════════════════════════════════════════════════
+# 8. CONFIRM ARRIVAL (ON_SHELF → ARRIVED)
+# ═══════════════════════════════════════════════════════════════
+@router.post("/{order_id}/arrival")
+async def confirm_arrival(
+    order_id: str,
+    req: ArrivalRequestLocal,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
+):
+    """User arrival detection via GPS or QR scan. ON_SHELF → ARRIVED."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    # Arrival dedup
+    if not req.idempotency_key:
+        req.idempotency_key = arrival_dedup_key(req.user_id, order_id)
+
+    cached = await check_idempotency(redis_client, req.idempotency_key)
+    if cached:
+        return cached
+
+    result = await session.execute(
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
     )
     order = result.scalar_one_or_none()
     if not order:
@@ -643,268 +917,192 @@ async def confirm_arrival(
     if order.status != "ON_SHELF":
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot confirm arrival: order is {order.status}"
+            detail=f"Cannot confirm arrival: order is {order.status}",
         )
 
-    # Validate GPS distance or QR scan
-    gps_distance = req.latitude  # Simplified — real impl uses haversine
-    qr_valid = req.qr_scan
-
+    # Validate GPS/QR
     context = {
-        "gps_distance": 100 if qr_valid else gps_distance,  # Simplified
-        "qr_scan_valid": qr_valid,
+        "gps_distance": 100 if req.qr_scan else 50,  # Simplified
+        "qr_scan_valid": req.qr_scan,
     }
 
     try:
         order.status = state_machine.transition("ON_SHELF", "ARRIVED", context=context)
-        setattr(order, "arrived_at", datetime.now(timezone.utc))
-        await persist_event(session, order_id, "ARRIVAL_DETECTED", {
-            "user_id": req.user_id,
-            "gps_distance": context.get("gps_distance"),
-            "qr_scan": qr_valid,
-            "validated": True,
-        })
+        order.arrived_at = datetime.now(timezone.utc)
+        await persist_event(
+            session, order_id, tenant_id, EventType.ARRIVAL_DETECTED.value,
+            {
+                "user_id": req.user_id,
+                "gps_distance": context["gps_distance"],
+                "qr_scan": req.qr_scan,
+                "validated": True,
+            },
+            idempotency_key_val=req.idempotency_key,
+        )
     except (InvalidTransitionError, GuardViolationError) as e:
         raise HTTPException(status_code=409, detail=str(e))
 
-    await session.commit()
-    await session.refresh(order)
+    await session.flush()
 
-    # Priority boost for orders still in prep
-    await emit_event(Event(order_id, "ARRIVAL_DETECTED", {
-        "user_id": req.user_id,
-        "arrival_boost": 20,
-        "validated": True,
-    }))
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
 
-    await set_order_state(order_id, {
-        "status": order.status,
-        "arrived_at": order.arrived_at.isoformat() if hasattr(order, 'arrived_at') else None,
-    })
+    await publish_event(
+        producer, EventType.ARRIVAL_DETECTED, order_id, tenant_id,
+        {"user_id": req.user_id, "arrival_boost": 20, "validated": True},
+    )
 
     response = format_order(order)
-    await mark_idempotent(req.idempotency_key, response)
+    await store_idempotency(redis_client, req.idempotency_key, response)
     return response
 
 
 # ═══════════════════════════════════════════════════════════════
-# 8. HANDOFF (V2: ARRIVED → HANDOFF_IN_PROGRESS → PICKED)
+# 9. HANDOFF (ARRIVED → HANDOFF_IN_PROGRESS → PICKED)
 # ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/handoff", response_model=OrderResponse)
+@router.post("/{order_id}/handoff")
 async def confirm_handoff(
     order_id: str,
     req: HandoffConfirmRequest,
-    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
 ):
-    """
-    Confirm order handoff to user via QR scan or manual ACK.
-    
-    V2 Flow: ARRIVED → HANDOFF_IN_PROGRESS → PICKED
-    - Staff scans QR or manually confirms handoff
-    - Releases shelf lock
-    - Decrements kitchen load
-    - Closes order lifecycle
-    """
-    cached = await enforce_idempotency(req.idempotency_key)
+    """Confirm order handoff. ARRIVED → HANDOFF_IN_PROGRESS → PICKED."""
+    tenant_id = user.get("tenant_id", req.tenant_id)
+    await set_tenant_id(session, tenant_id)
+
+    cached = await check_idempotency(redis_client, req.idempotency_key)
     if cached:
         return cached
 
     result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
     )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Support both ARRIVED → HANDOFF_IN_PROGRESS → PICKED
-    # and ON_SHELF → PICKED (legacy path for backward compat)
+    # ARRIVED → HANDOFF_IN_PROGRESS
     if order.status == "ARRIVED":
         try:
             order.status = state_machine.transition("ARRIVED", "HANDOFF_IN_PROGRESS")
-            await persist_event(session, order_id, "HANDOFF_STARTED", {
-                "staff_id": req.staff_id,
-                "method": req.confirmation_method,
-            })
+            await persist_event(
+                session, order_id, tenant_id, EventType.HANDOFF_STARTED.value,
+                {"staff_id": req.staff_id, "method": req.confirmation_method},
+            )
         except InvalidTransitionError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
+    # HANDOFF_IN_PROGRESS → PICKED
     if order.status == "HANDOFF_IN_PROGRESS":
         try:
             order.status = state_machine.transition("HANDOFF_IN_PROGRESS", "PICKED")
             order.picked_at = datetime.now(timezone.utc)
-            await persist_event(session, order_id, "HANDOFF_COMPLETED", {
-                "staff_id": req.staff_id,
-                "method": req.confirmation_method,
-            })
-        except InvalidTransitionError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-
-    elif order.status == "ON_SHELF":
-        # Legacy path (backward compat)
-        try:
-            order.status = state_machine.transition("ON_SHELF", "PICKED")
-            order.picked_at = datetime.now(timezone.utc)
-            await persist_event(session, order_id, "ORDER_PICKED", {
-                "staff_id": req.staff_id,
-            })
+            await persist_event(
+                session, order_id, tenant_id, EventType.HANDOFF_COMPLETED.value,
+                {"staff_id": req.staff_id, "method": req.confirmation_method},
+                idempotency_key_val=req.idempotency_key,
+            )
         except InvalidTransitionError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
     # Release shelf lock
-    if order.shelf_id and order.shelf_id != "HOLD_ZONE":
-        await release_lock(f"shelf:{order.shelf_id}", order_id)
+    if order.shelf_id and order.shelf_id != "HOLD_ZONE" and redis_client:
+        await redis_client.release_shelf_lock(
+            order.shelf_id, order_id, tenant_id=tenant_id
+        )
 
-    await session.commit()
-    await session.refresh(order)
+    await session.flush()
 
-    # Update Redis
-    await decrement_kitchen_load(str(order.kitchen_id))
-    await set_order_state(order_id, {"status": order.status})
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
 
-    # Emit final events
-    await emit_event(Event(order_id, "HANDOFF_COMPLETED", {
-        "staff_id": req.staff_id,
-        "shelf_id": order.shelf_id,
-    }))
-    await emit_event(Event(order_id, "ORDER_PICKED", {}))
+    await publish_event(
+        producer, EventType.HANDOFF_COMPLETED, order_id, tenant_id,
+        {"staff_id": req.staff_id, "shelf_id": order.shelf_id},
+    )
+    await publish_event(
+        producer, EventType.ORDER_PICKED, order_id, tenant_id,
+        {"picked_at": order.picked_at.isoformat() if order.picked_at else None},
+    )
 
     response = format_order(order)
-    await mark_idempotent(req.idempotency_key, response)
+    await store_idempotency(redis_client, req.idempotency_key, response)
     return response
 
 
 # ═══════════════════════════════════════════════════════════════
-# 9. EXPIRE ORDER (V2: ON_SHELF/ARRIVED → EXPIRED)
+# 10. EXPIRE ORDER
 # ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/expire", response_model=OrderResponse)
+@router.post("/{order_id}/expire")
 async def expire_order(
     order_id: str,
-    reason: str = "SHELF_TTL_EXCEEDED",
-    session: AsyncSession = Depends(get_session),
+    req: ExpireRequest = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
 ):
-    """
-    Mark order as expired (shelf TTL exceeded).
-    
-    V2 Flow: ON_SHELF/ARRIVED → EXPIRED
-    - Triggered by shelf TTL engine
-    - Attempts warm station move before expiring
-    - Auto-triggers compensation (refund) flow
-    """
+    """Mark order as expired (shelf TTL exceeded). ON_SHELF/ARRIVED → EXPIRED."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    reason = req.reason if req else "SHELF_TTL_EXCEEDED"
+
     result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
     )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    if order.status not in ["ON_SHELF", "ARRIVED", "HANDOFF_IN_PROGRESS"]:
+    if order.status not in ("ON_SHELF", "ARRIVED", "HANDOFF_IN_PROGRESS"):
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot expire: order is {order.status}"
+            detail=f"Cannot expire: order is {order.status}",
         )
 
-    # Try warm station extension first
-    warm_extension_applied = False
-    if order.status == "ON_SHELF" and reason == "SHELF_TTL_EXCEEDED":
-        # Check if warm station available
-        warm_available = True  # Simplified — real impl checks kitchen state
-        if warm_available and getattr(order, "shelf_zone", "HOT") == "HOT":
-            # Extend TTL by +5 minutes via warm station
-            setattr(order, "shelf_ttl_remaining", WARM_STATION_TTL_EXTENSION)
-            warm_extension_applied = True
-            await persist_event(session, order_id, "WARM_STATION_EXTENSION", {
-                "new_ttl": WARM_STATION_TTL_EXTENSION,
-            })
-            await session.commit()
-            await session.refresh(order)
-            return format_order(order)
+    context = {
+        "current_state": order.status,
+        "shelf_ttl_exceeded": True,
+    }
 
-    # Expire the order
     try:
-        context = {
-            "current_state": order.status,
-            "shelf_ttl_exceeded": True,
-        }
         order.status = state_machine.transition(order.status, "EXPIRED", context=context)
-        await persist_event(session, order_id, "ORDER_EXPIRED", {
-            "reason": reason,
-            "warm_extension_attempted": warm_extension_applied,
-        })
+        await persist_event(
+            session, order_id, tenant_id, EventType.ORDER_EXPIRED.value,
+            {"reason": reason},
+        )
     except (InvalidTransitionError, GuardViolationError) as e:
         raise HTTPException(status_code=409, detail=str(e))
 
     # Release shelf lock
-    if order.shelf_id and order.shelf_id != "HOLD_ZONE":
-        await release_lock(f"shelf:{order.shelf_id}", order_id)
+    if order.shelf_id and order.shelf_id != "HOLD_ZONE" and redis_client:
+        await redis_client.release_shelf_lock(order.shelf_id, order_id, tenant_id=tenant_id)
 
-    await session.commit()
-    await session.refresh(order)
+    await session.flush()
 
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "ORDER_EXPIRED", {
-        "reason": reason,
-        "shelf_id": order.shelf_id,
-    }))
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
+
+    await publish_event(
+        producer, EventType.ORDER_EXPIRED, order_id, tenant_id,
+        {"reason": reason, "shelf_id": order.shelf_id},
+    )
 
     # Auto-trigger compensation
-    await emit_event(Event(order_id, "COMPENSATION_TRIGGERED", {
-        "reason": reason,
-        "amount": order.total_amount,
-        "auto_triggered": True,
-    }))
-
-    return format_order(order)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 10. REFUND ORDER (V2: EXPIRED → REFUNDED)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/refund", response_model=OrderResponse)
-async def refund_order(
-    order_id: str,
-    reason: str = "SHELF_EXPIRED",
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Process refund for an expired order.
-    
-    V2 Flow: EXPIRED → REFUNDED
-    - Initiated by compensation service or manual ops action
-    - Integrates with UPI refund API
-    - Logs penalty for store if expiry was kitchen's fault
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+    await publish_event(
+        producer, EventType.COMPENSATION_TRIGGERED, order_id, tenant_id,
+        {"reason": reason, "amount": order.total_amount, "auto_triggered": True},
     )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if order.status != "EXPIRED":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot refund: order is {order.status} (expected EXPIRED)"
-        )
-
-    try:
-        order.status = state_machine.transition("EXPIRED", "REFUNDED")
-        await persist_event(session, order_id, "ORDER_REFUNDED", {
-            "reason": reason,
-            "amount": order.total_amount,
-            "payment_ref": order.payment_ref,
-        })
-    except InvalidTransitionError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    await decrement_kitchen_load(str(order.kitchen_id))
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "ORDER_REFUNDED", {
-        "reason": reason,
-        "amount": order.total_amount,
-    }))
 
     return format_order(order)
 
@@ -912,17 +1110,29 @@ async def refund_order(
 # ═══════════════════════════════════════════════════════════════
 # 11. CANCEL ORDER
 # ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/cancel", response_model=OrderResponse)
+@router.post("/{order_id}/cancel")
 async def cancel_order(
     order_id: str,
     req: CancelRequest = None,
-    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    producer=Depends(get_kafka_producer),
+    redis_client=Depends(get_redis),
 ):
-    """
-    Cancel an order (only possible before IN_PREP in V2).
-    """
+    """Cancel an order. Only cancellable states allow this."""
+    tenant_id = user.get("tenant_id", req.tenant_id if req else "default")
+    await set_tenant_id(session, tenant_id)
+
+    idem_key = req.idempotency_key if req else None
+    cached = await check_idempotency(redis_client, idem_key)
+    if cached:
+        return cached
+
     result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
     )
     order = result.scalar_one_or_none()
     if not order:
@@ -931,99 +1141,84 @@ async def cancel_order(
     if not state_machine.is_cancellable(order.status):
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot cancel order in {order.status} state"
+            detail=f"Cannot cancel order in {order.status} state",
         )
 
     if not state_machine.can_transition(order.status, "CANCELLED"):
         raise HTTPException(
             status_code=409,
-            detail=f"No transition from {order.status} to CANCELLED"
+            detail=f"No transition from {order.status} to CANCELLED",
         )
 
+    previous_status = order.status
     order.status = "CANCELLED"
-    await persist_event(session, order_id, "ORDER_CANCELLED", {
-        "reason": req.reason if req else None,
-        "from_state": order.status,
-    })
+    await persist_event(
+        session, order_id, tenant_id, EventType.ORDER_CANCELLED.value,
+        {"reason": req.reason if req else None, "from_state": previous_status},
+        idempotency_key_val=idem_key,
+    )
 
     # Release resources
-    if order.shelf_id and order.shelf_id != "HOLD_ZONE":
-        await release_lock(f"shelf:{order.shelf_id}", order_id)
-    await decrement_kitchen_load(str(order.kitchen_id))
+    if order.shelf_id and order.shelf_id != "HOLD_ZONE" and redis_client:
+        await redis_client.release_shelf_lock(order.shelf_id, order_id, tenant_id=tenant_id)
 
-    await session.commit()
-    await session.refresh(order)
+    await session.flush()
 
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "ORDER_CANCELLED", {
-        "reason": req.reason if req else None,
-    }))
+    if redis_client:
+        await redis_client.set_order_status(order_id, order.status, tenant_id)
 
-    return format_order(order)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 12. MARK FAILED (V2: Any → FAILED)
-# ═══════════════════════════════════════════════════════════════
-@router.post("/{order_id}/fail", response_model=OrderResponse)
-async def mark_failed(
-    order_id: str,
-    reason: str = "SYSTEM_ERROR",
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Mark order as failed (terminal state for system errors).
-    
-    V2: Any state can transition to FAILED for unrecoverable errors.
-    """
-    result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+    # Get compensation steps for the previous state
+    comp_steps = state_machine.get_compensation_steps(previous_status)
+    await publish_event(
+        producer, EventType.ORDER_CANCELLED, order_id, tenant_id,
+        {"reason": req.reason if req else None, "compensation_steps": comp_steps},
+        kitchen_id=str(order.kitchen_id),
     )
-    order = result.scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
 
-    if not state_machine.can_transition(order.status, "FAILED"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot fail order in {order.status} state"
+    # Trigger compensation if payment was confirmed
+    if previous_status in ("PAYMENT_CONFIRMED", "SLOT_RESERVED", "QUEUE_ASSIGNED",
+                           "IN_PREP", "BATCH_WAIT", "PACKING", "READY", "ON_SHELF"):
+        await publish_event(
+            producer, EventType.COMPENSATION_TRIGGERED, order_id, tenant_id,
+            {
+                "reason": f"ORDER_CANCELLED from {previous_status}",
+                "amount": order.total_amount,
+                "auto_triggered": True,
+                "compensation_steps": comp_steps,
+            },
         )
 
-    order.status = "FAILED"
-    await persist_event(session, order_id, "ORDER_FAILED", {
-        "reason": reason,
-        "from_state": order.status,
-    })
-
-    # Release all resources
-    if order.shelf_id and order.shelf_id != "HOLD_ZONE":
-        await release_lock(f"shelf:{order.shelf_id}", order_id)
-    await decrement_kitchen_load(str(order.kitchen_id))
-
-    await session.commit()
-    await session.refresh(order)
-
-    await set_order_state(order_id, {"status": order.status})
-    await emit_event(Event(order_id, "ORDER_FAILED", {"reason": reason}))
-
-    return format_order(order)
+    response = format_order(order)
+    await store_idempotency(redis_client, idem_key, response)
+    return response
 
 
 # ═══════════════════════════════════════════════════════════════
-# 13. GET ORDER (READ — Redis-first)
+# 12. GET ORDER
 # ═══════════════════════════════════════════════════════════════
-@router.get("/{order_id}", response_model=OrderResponse)
+@router.get("/{order_id}")
 async def get_order(
     order_id: str,
-    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    redis_client=Depends(get_redis),
 ):
-    """Get order details (Redis cache first, then Postgres)."""
-    cached = await get_order_state(order_id)
-    if cached:
-        return OrderResponse(order_id=order_id, **cached)
+    """Get order details."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    # Redis cache first
+    if redis_client:
+        cached_status = await redis_client.get_order_status(order_id, tenant_id)
+        if cached_status:
+            # Still need full data from DB
+            pass
 
     result = await session.execute(
-        select(OrderModel).where(OrderModel.id == uuid.UUID(order_id))
+        select(OrderModel).where(
+            OrderModel.id == uuid.UUID(order_id),
+            OrderModel.tenant_id == tenant_id,
+        )
     )
     order = result.scalar_one_or_none()
     if not order:
@@ -1033,52 +1228,97 @@ async def get_order(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 14. GET EVENT LOG (AUDIT TRAIL)
+# 13. GET EVENT LOG
 # ═══════════════════════════════════════════════════════════════
-@router.get("/{order_id}/events", response_model=EventLogResponse)
+@router.get("/{order_id}/events")
 async def get_order_events(
     order_id: str,
-    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
 ):
-    """Get full event log for an order (event sourcing audit trail)."""
+    """Get full event log for an order (audit trail)."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
     result = await session.execute(
         select(OrderEventModel)
-        .where(OrderEventModel.order_id == uuid.UUID(order_id))
+        .where(
+            OrderEventModel.order_id == uuid.UUID(order_id),
+            OrderEventModel.tenant_id == tenant_id,
+        )
         .order_by(OrderEventModel.created_at)
     )
     events = result.scalars().all()
 
     return EventLogResponse(
         order_id=order_id,
+        tenant_id=tenant_id,
         events=[{
+            "event_id": str(e.id),
             "event_type": e.event_type,
             "payload": e.payload,
-            "source": getattr(e, "source", None),
+            "source": e.source,
+            "sequence_number": e.sequence_number,
             "created_at": e.created_at.isoformat() if e.created_at else None,
         } for e in events],
     )
 
 
 # ═══════════════════════════════════════════════════════════════
-# 15. GET KITCHEN QUEUE
+# 14. GET ORDERS BY KITCHEN
 # ═══════════════════════════════════════════════════════════════
-@router.get("/kitchen/{kitchen_id}/queue")
-async def get_kitchen_queue(
+@router.get("/kitchen/{kitchen_id}")
+async def get_kitchen_orders(
     kitchen_id: str,
-    session: AsyncSession = Depends(get_session),
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
 ):
-    """Get current kitchen queue with priority-sorted orders."""
-    result = await session.execute(
-        select(OrderModel)
-        .where(OrderModel.kitchen_id == uuid.UUID(kitchen_id))
-        .where(OrderModel.status.in_(["QUEUE_ASSIGNED", "IN_PREP", "BATCH_WAIT", "PACKING"]))
-        .order_by(OrderModel.created_at)
+    """List orders by kitchen."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    query = select(OrderModel).where(
+        OrderModel.kitchen_id == uuid.UUID(kitchen_id),
+        OrderModel.tenant_id == tenant_id,
     )
+    if status_filter:
+        query = query.where(OrderModel.status == status_filter)
+
+    query = query.order_by(OrderModel.created_at.desc()).limit(limit).offset(offset)
+    result = await session.execute(query)
     orders = result.scalars().all()
 
-    return {
-        "kitchen_id": kitchen_id,
-        "queue_depth": len(orders),
-        "orders": [format_order(o) for o in orders],
-        "kitchen_load": await get_kitchen_load(kitchen_id),
-    }
+    return [format_order(o) for o in orders]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 15. GET ORDERS BY USER
+# ═══════════════════════════════════════════════════════════════
+@router.get("/user/{user_id}")
+async def get_user_orders(
+    user_id: str,
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """List orders by user."""
+    tenant_id = user.get("tenant_id", "default")
+    await set_tenant_id(session, tenant_id)
+
+    query = select(OrderModel).where(
+        OrderModel.user_id == uuid.UUID(user_id),
+        OrderModel.tenant_id == tenant_id,
+    )
+    if status_filter:
+        query = query.where(OrderModel.status == status_filter)
+
+    query = query.order_by(OrderModel.created_at.desc()).limit(limit).offset(offset)
+    result = await session.execute(query)
+    orders = result.scalars().all()
+
+    return [format_order(o) for o in orders]

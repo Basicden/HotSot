@@ -1,0 +1,106 @@
+"""
+HotSot Shared Types — Domain models and schemas for all services.
+
+V1 models (models.py) are kept for backward compatibility.
+V2 schemas (schemas.py) are the production-grade definitions with
+the full 16-state order lifecycle and complete event taxonomy.
+"""
+
+# V1 backward-compatible models
+from shared.types.models import (
+    OrderStatus as V1OrderStatus,
+    EventType as V1EventType,
+    VALID_TRANSITIONS as V1_VALID_TRANSITIONS,
+    Order,
+    OrderEvent,
+    ShelfSlot,
+    KitchenLoad,
+    ETAPrediction,
+    ArrivalSignal,
+)
+
+# V2 production-grade schemas
+from shared.types.schemas import (
+    OrderStatus,
+    EventType,
+    VALID_TRANSITIONS,
+    TERMINAL_STATES,
+    CANCELLABLE_STATES,
+    RiskLevel,
+    UserTier,
+    QueueType,
+    ShelfZone,
+    BatchCategory,
+    BATCH_CATEGORY_MAP,
+    TIER_WEIGHTS,
+    SHELF_TTL_SECONDS,
+    KITCHEN_THROUGHPUT,
+    PEAK_DEGRADATION,
+    EventEnvelope,
+    OrderCreateRequest,
+    PaymentInitRequest,
+    PaymentConfirmRequest,
+    ArrivalRequest,
+    HandoffConfirmRequest,
+    CancelRequest,
+    OrderResponse,
+    EventLogResponse,
+    ETAResponse,
+    ShelfAssignment,
+    KitchenPriorityScore,
+    CompensationEvent,
+    IncidentEvent,
+    DLQMessage,
+    KAFKA_TOPICS,
+    GUARD_RULES,
+    IDEMPOTENCY_STRATEGIES,
+    CONFLICT_RESOLUTION,
+)
+
+__all__ = [
+    # V1 (backward compat)
+    "V1OrderStatus",
+    "V1EventType",
+    "V1_VALID_TRANSITIONS",
+    "Order",
+    "OrderEvent",
+    "ShelfSlot",
+    "KitchenLoad",
+    "ETAPrediction",
+    "ArrivalSignal",
+    # V2 (production)
+    "OrderStatus",
+    "EventType",
+    "VALID_TRANSITIONS",
+    "TERMINAL_STATES",
+    "CANCELLABLE_STATES",
+    "RiskLevel",
+    "UserTier",
+    "QueueType",
+    "ShelfZone",
+    "BatchCategory",
+    "BATCH_CATEGORY_MAP",
+    "TIER_WEIGHTS",
+    "SHELF_TTL_SECONDS",
+    "KITCHEN_THROUGHPUT",
+    "PEAK_DEGRADATION",
+    "EventEnvelope",
+    "OrderCreateRequest",
+    "PaymentInitRequest",
+    "PaymentConfirmRequest",
+    "ArrivalRequest",
+    "HandoffConfirmRequest",
+    "CancelRequest",
+    "OrderResponse",
+    "EventLogResponse",
+    "ETAResponse",
+    "ShelfAssignment",
+    "KitchenPriorityScore",
+    "CompensationEvent",
+    "IncidentEvent",
+    "DLQMessage",
+    "KAFKA_TOPICS",
+    "GUARD_RULES",
+    "IDEMPOTENCY_STRATEGIES",
+    "CONFLICT_RESOLUTION",
+]

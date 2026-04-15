@@ -1,23 +1,33 @@
-"""HotSot Order Service — V2 Production-Grade State Machine Engine.
+"""
+HotSot Order Service — V2 Production-Grade State Machine Engine.
 
-V2 adds 8 new states: PAYMENT_PENDING, QUEUE_ASSIGNED, BATCH_WAIT, PACKING,
-ARRIVED, HANDOFF_IN_PROGRESS, EXPIRED, REFUNDED, FAILED
+16-state order lifecycle with guard conditions and compensation paths.
 
-V2 corrects the order flow: CREATED → PAYMENT_PENDING → PAYMENT_CONFIRMED →
-SLOT_RESERVED → QUEUE_ASSIGNED → IN_PREP → PACKING → READY → ON_SHELF →
+Flow: CREATED → PAYMENT_PENDING → PAYMENT_CONFIRMED → SLOT_RESERVED →
+QUEUE_ASSIGNED → IN_PREP → [BATCH_WAIT] → PACKING → READY → ON_SHELF →
 ARRIVED → HANDOFF_IN_PROGRESS → PICKED
 
+Failure paths: EXPIRED, REFUNDED, CANCELLED, FAILED
+
 Guard rules enforce business invariants at critical transitions.
+All transition definitions come from shared.types.schemas.
 """
 
+from __future__ import annotations
+
 from typing import Dict, List, Optional, Callable
+
 from shared.types.schemas import (
-    VALID_TRANSITIONS, TERMINAL_STATES, CANCELLABLE_STATES, GUARD_RULES,
+    VALID_TRANSITIONS,
+    TERMINAL_STATES,
+    CANCELLABLE_STATES,
+    GUARD_RULES,
 )
 
 
 class InvalidTransitionError(Exception):
     """Raised when an invalid state transition is attempted."""
+
     def __init__(self, current: str, target: str, reason: str = ""):
         self.current = current
         self.target = target
@@ -30,11 +40,14 @@ class InvalidTransitionError(Exception):
 
 class GuardViolationError(Exception):
     """Raised when a guard condition prevents a transition."""
+
     def __init__(self, current: str, target: str, guard: str):
         self.current = current
         self.target = target
         self.guard = guard
-        super().__init__(f"Guard violation for {current} → {target}: {guard}")
+        super().__init__(
+            f"Guard violation for {current} → {target}: {guard}"
+        )
 
 
 class StateMachine:
@@ -47,7 +60,20 @@ class StateMachine:
     - Terminal state detection
     - Cancellation eligibility checking
     - Explicit failure paths (EXPIRED, FAILED, REFUNDED)
+    - Compensation-aware: knows which states need rollback
     """
+
+    # States that require compensation (resource release) on cancellation
+    COMPENSATION_STATES = {
+        "PAYMENT_CONFIRMED": ["RefundPayment"],
+        "SLOT_RESERVED": ["ReleaseSlot"],
+        "QUEUE_ASSIGNED": ["ReleaseSlot"],
+        "IN_PREP": ["RefundPayment", "ReleaseSlot"],
+        "BATCH_WAIT": ["ReleaseSlot"],
+        "PACKING": ["RefundPayment", "ReleaseSlot"],
+        "READY": ["RefundPayment", "ReleaseSlot"],
+        "ON_SHELF": ["RefundPayment", "ReleaseShelf", "ReleaseSlot"],
+    }
 
     def __init__(
         self,
@@ -87,7 +113,8 @@ class StateMachine:
         if not self.can_transition(current, target):
             raise InvalidTransitionError(
                 current, target,
-                f"Allowed transitions from {current}: {self.transitions.get(current, [])}"
+                f"Allowed transitions from {current}: "
+                f"{self.transitions.get(current, [])}",
             )
 
         # Evaluate guard rule if exists for target state
@@ -140,6 +167,14 @@ class StateMachine:
         """Check if order can be cancelled from this state."""
         return state in CANCELLABLE_STATES
 
+    def get_compensation_steps(self, state: str) -> List[str]:
+        """
+        Get compensation steps required when cancelling from this state.
+
+        Returns ordered list of compensation actions to execute.
+        """
+        return self.COMPENSATION_STATES.get(state, [])
+
     def get_state_info(self, state: str) -> Dict:
         """Get detailed info about a state."""
         return {
@@ -148,6 +183,7 @@ class StateMachine:
             "is_cancellable": self.is_cancellable(state),
             "valid_next_states": self.get_valid_next_states(state),
             "guard_rule": GUARD_RULES.get(state),
+            "compensation_steps": self.get_compensation_steps(state),
         }
 
     def validate_sequence(self, transitions: List[Dict]) -> List[str]:

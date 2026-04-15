@@ -1,114 +1,66 @@
-"""
-HotSot Arrival Service — FastAPI Application
-=============================================
-Main entry point for the arrival detection microservice.
+"""HotSot Arrival Service — V2 Production-Grade."""
 
-Startup:
-  - Initialise Redis connection pool
-  - Verify Kafka connectivity (best-effort)
-
-Shutdown:
-  - Close Redis and Kafka connections gracefully
-"""
-
-from __future__ import annotations
-
-import logging
-import sys
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
-from app.core.config import get_settings
+from shared.utils.config import get_settings
+from shared.utils.database import init_service_db
+from shared.utils.redis_client import RedisClient
+from shared.utils.kafka_client import KafkaProducer
+from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
+from shared.utils.middleware import (
+    ErrorHandlingMiddleware, CorrelationIDMiddleware,
+    RequestLoggingMiddleware, RateLimitMiddleware, TenantMiddleware,
+)
+
+from app.core.database import Base
 from app.routes.arrival import router as arrival_router
 
-# ── Logging ────────────────────────────────────────────────────────────
+settings = get_settings("arrival")
+logger = setup_logging("arrival-service")
+redis_client = RedisClient()
+kafka_producer = KafkaProducer("arrival-service")
+health_checker = HealthChecker("arrival-service")
 
-settings = get_settings()
-
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    stream=sys.stdout,
-)
-logger = logging.getLogger(settings.service_name)
-
-
-# ── Lifespan (startup / shutdown) ──────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage resources that live for the duration of the application."""
-    logger.info("🚀 %s starting up", settings.service_name)
-    logger.info("   Redis URL        : %s", settings.redis_url)
-    logger.info("   Kafka brokers    : %s", settings.kafka_bootstrap_servers)
-    logger.info("   Arrival radius   : %sm", settings.arrival_radius_m)
-    logger.info("   QR rotation      : %ss", settings.qr_token_rotation_s)
-    logger.info("   Dedup window     : %ss", settings.dedup_window_s)
-    logger.info("   Priority boost   : +%d", settings.priority_boost_amount)
-
-    # Pre-warm Redis connection
-    from app.core.dedup import ArrivalDedupEngine
-    engine = ArrivalDedupEngine()
-    try:
-        r = await engine._get_redis()
-        await r.ping()
-        logger.info("   Redis connection  : OK")
-    except Exception:
-        logger.warning("   Redis connection  : FAILED (will retry on demand)")
-
-    yield  # ── app is running ──────────────────────────────────────────
-
-    # Graceful shutdown
-    logger.info("🛑 %s shutting down", settings.service_name)
-    try:
-        if engine._redis:
-            await engine._redis.close()
-            logger.info("   Redis connection closed")
-    except Exception:
-        logger.exception("   Error closing Redis")
+    await init_service_db("arrival", Base.metadata)
+    await redis_client.connect()
+    await kafka_producer.start()
+    health_checker.mark_ready(True)
+    logger.info("arrival_service_started")
+    yield
+    await kafka_producer.stop()
+    await redis_client.disconnect()
+    health_checker.mark_ready(False)
+    logger.info("arrival_service_stopped")
 
 
-# ── App ────────────────────────────────────────────────────────────────
+app = FastAPI(title="HotSot Arrival Service", version="2.0.0", lifespan=lifespan)
 
-app = FastAPI(
-    title="HotSot Arrival Service",
-    description=(
-        "Detects user arrivals at kitchen pickup locations via GPS or QR scan. "
-        "Hard arrivals trigger priority boosts; soft arrivals are logged only. "
-        "Deduplication prevents duplicate events within configurable time windows."
-    ),
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app.add_middleware(ErrorHandlingMiddleware)
+app.add_middleware(CorrelationIDMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RateLimitMiddleware, redis_client=redis_client, requests_per_minute=120)
+app.add_middleware(TenantMiddleware)
+setup_tracing("arrival-service", app)
 
-# ── Routes ─────────────────────────────────────────────────────────────
-
-app.include_router(arrival_router)
+app.include_router(arrival_router, prefix="/arrival", tags=["arrival"])
 
 
-# ── Health / readiness ─────────────────────────────────────────────────
-
-@app.get("/health", tags=["ops"])
-async def health():
-    """Liveness probe."""
-    return {"status": "ok", "service": settings.service_name}
+@app.get("/health/live")
+async def liveness():
+    return health_checker.liveness()
 
 
-@app.get("/ready", tags=["ops"])
+@app.get("/health/ready")
 async def readiness():
-    """Readiness probe — checks Redis connectivity."""
-    from app.core.dedup import ArrivalDedupEngine
-    engine = ArrivalDedupEngine()
-    try:
-        r = await engine._get_redis()
-        await r.ping()
-        redis_ok = True
-    except Exception:
-        redis_ok = False
+    db_ok = await health_checker.check_db("arrival")
+    redis_ok = await health_checker.check_redis(redis_client)
+    return health_checker.readiness(db_ok=db_ok, redis_ok=redis_ok)
 
-    return {
-        "status": "ok" if redis_ok else "degraded",
-        "service": settings.service_name,
-        "redis": redis_ok,
-    }
+
+@app.get("/health/startup")
+async def startup():
+    return health_checker.startup()
