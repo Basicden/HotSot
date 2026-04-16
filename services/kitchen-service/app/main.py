@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from shared.utils.config import get_settings
-from shared.utils.database import init_service_db
+from shared.utils.database import init_service_db, get_session_factory
 from shared.utils.redis_client import RedisClient
 from shared.utils.kafka_client import KafkaProducer, KafkaConsumerManager
 from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
@@ -21,7 +21,7 @@ from shared.utils.middleware import (
 )
 
 from app.core.database import Base
-from app.routes.kitchen import router as kitchen_router
+from app.routes.kitchen import router as kitchen_router, set_dependencies
 from app.routes.queue import router as queue_router
 from app.routes.batch import router as batch_router
 from app.core.kafka_handlers import start_consumers, stop_consumers
@@ -40,6 +40,8 @@ async def lifespan(app: FastAPI):
     # Startup
     await init_service_db("kitchen", Base.metadata)
     await redis_client.connect()
+    session_factory = get_session_factory("kitchen")
+    set_dependencies(session_factory, redis_client)
     await kafka_producer.start()
     await start_consumers()
     health_checker.mark_ready(True)

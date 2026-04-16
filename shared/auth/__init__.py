@@ -16,6 +16,10 @@ from shared.auth.jwt import (
     require_role,
     require_tenant,
     TokenPayload,
+    TokenRevocation,
+    token_revocation,
+    setup_token_revocation,
+    logout,
 )
 from shared.auth.api_key import (
     generate_api_key,
@@ -35,6 +39,10 @@ __all__ = [
     "require_role",
     "require_tenant",
     "TokenPayload",
+    "TokenRevocation",
+    "token_revocation",
+    "setup_token_revocation",
+    "logout",
     # API Key
     "generate_api_key",
     "verify_api_key",

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from shared.utils.config import get_settings
-from shared.utils.database import init_service_db
+from shared.utils.database import init_service_db, get_session_factory
 from shared.utils.redis_client import RedisClient
 from shared.utils.kafka_client import KafkaProducer
 from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
@@ -14,7 +14,7 @@ from shared.utils.middleware import (
 )
 
 from app.core.database import Base
-from app.routes.compensation import router as compensation_router
+from app.routes.compensation import router as compensation_router, set_dependencies
 
 settings = get_settings("compensation")
 logger = setup_logging("compensation-service")
@@ -27,6 +27,8 @@ health_checker = HealthChecker("compensation-service")
 async def lifespan(app: FastAPI):
     await init_service_db("compensation", Base.metadata)
     await redis_client.connect()
+    session_factory = get_session_factory("compensation")
+    set_dependencies(session_factory, redis_client, kafka_producer)
     await kafka_producer.start()
     health_checker.mark_ready(True)
     logger.info("compensation_service_started")
