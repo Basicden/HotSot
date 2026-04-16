@@ -10,12 +10,7 @@ data:
   REDIS_URL: "redis://redis.hotsot.svc.cluster.local:6379/0"
   POSTGRES_HOST: "postgres.hotsot.svc.cluster.local"
   POSTGRES_USER: "hotsot"
-  POSTGRES_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
-  JWT_SECRET_KEY: "CHANGE_ME_JWT_SECRET"
-  AUTH_SECRET: "CHANGE_ME_AUTH_SECRET"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger.hotsot.svc.cluster.local:4317"
-  RAZORPAY_KEY_ID: "CHANGE_ME_RAZORPAY_KEY"
-  RAZORPAY_KEY_SECRET: "CHANGE_ME_RAZORPAY_SECRET"
 ---
 # Shared service template — each service gets its own Deployment + Service
 # Below are all 18 service Deployments

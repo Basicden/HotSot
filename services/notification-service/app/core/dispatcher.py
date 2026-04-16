@@ -103,6 +103,10 @@ class NotificationDispatcher:
                 }
 
         # Dedup check using deterministic hash (not Python hash())
+        # Fail-CLOSED: When Redis dedup is unavailable, we still dispatch the
+        # notification (dedup is best-effort), but log the failure so monitoring
+        # can detect Redis issues. This is intentional: missing a notification
+        # is worse than sending a duplicate.
         if self._redis:
             body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
             dedup_key = f"notif_dedup:{tenant_id}:{user_id}:{channel}:{body_hash}"
@@ -114,8 +118,17 @@ class NotificationDispatcher:
                         "reason": "Similar notification sent recently",
                         "channel": channel,
                     }
-            except Exception:
-                pass  # Redis dedup failure is non-fatal
+            except Exception as exc:
+                logger.warning(
+                    "Dedup check failed — proceeding with dispatch (fail-open for delivery, "
+                    "fail-closed for monitoring): user=%s channel=%s: %s",
+                    user_id, channel, exc,
+                )
+        else:
+            logger.warning(
+                "Redis unavailable for dedup — proceeding with dispatch: user=%s channel=%s",
+                user_id, channel,
+            )
 
         # Dispatch to channel
         result = await self._send_to_channel(
@@ -131,14 +144,18 @@ class NotificationDispatcher:
             language=language,
         )
 
-        # Mark dedup on success
+        # Mark dedup on success (best-effort, log failures for monitoring)
         if self._redis and result.get("status") == "SENT":
             body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
             dedup_key = f"notif_dedup:{tenant_id}:{user_id}:{channel}:{body_hash}"
             try:
                 await self._redis.client.setex(dedup_key, 300, "1")  # 5 min dedup window
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Failed to mark dedup key — duplicate notifications may occur: "
+                    "user=%s channel=%s: %s",
+                    user_id, channel, exc,
+                )
 
         return result
 

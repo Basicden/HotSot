@@ -88,7 +88,12 @@ def _kafka_consumer_loop():
 
 
 def _handle_order_picked(event: dict):
-    """Process order.picked — record actual vs predicted ETA."""
+    """Process order.picked — record actual vs predicted ETA.
+
+    Fail-CLOSED: When Redis is unavailable, feedback data is NOT silently
+    lost. An error is logged at ERROR level to ensure the feedback gap
+    is visible in monitoring and alerting.
+    """
     order_id = event.get("order_id")
     kitchen_id = event.get("kitchen_id")
 
@@ -110,8 +115,14 @@ def _handle_order_picked(event: dict):
                 order_id, predicted_eta, actual_seconds, error_seconds,
             )
 
-            # Store in Redis for next training run
-            if redis_client:
+            # Store in Redis for next training run (fail-closed)
+            if redis_client is None:
+                logger.error(
+                    "ML Feedback LOST: Redis unavailable — cannot store positive feedback for order=%s",
+                    order_id,
+                )
+                return
+            try:
                 redis_client.lpush("ml:feedback:positive", json.dumps({
                     "order_id": order_id,
                     "kitchen_id": kitchen_id,
@@ -121,12 +132,22 @@ def _handle_order_picked(event: dict):
                     "weight": 1,
                     "timestamp": datetime.utcnow().isoformat(),
                 }))
+            except redis_lib.RedisError as exc:
+                logger.error(
+                    "ML Feedback LOST: Redis error — cannot store positive feedback for order=%s: %s",
+                    order_id, exc,
+                )
         except Exception as exc:
             logger.warning("Failed to process order.picked feedback: %s", exc)
 
 
 def _handle_shelf_expired(event: dict):
-    """Process shelf.expired — record overestimation (negative signal, 3x weight)."""
+    """Process shelf.expired — record overestimation (negative signal, 3x weight).
+
+    Fail-CLOSED: When Redis is unavailable, feedback data is NOT silently
+    lost. An error is logged at ERROR level to ensure the feedback gap
+    is visible in monitoring and alerting.
+    """
     order_id = event.get("order_id")
     kitchen_id = event.get("kitchen_id")
 
@@ -135,18 +156,26 @@ def _handle_shelf_expired(event: dict):
         order_id,
     )
 
-    # Store as negative feedback with 3x weight
-    if redis_client:
-        try:
-            redis_client.lpush("ml:feedback:negative", json.dumps({
-                "order_id": order_id,
-                "kitchen_id": kitchen_id,
-                "reason": "shelf_expired",
-                "weight": 3,  # 3x weight in training
-                "timestamp": datetime.utcnow().isoformat(),
-            }))
-        except Exception as exc:
-            logger.warning("Failed to store shelf.expired feedback: %s", exc)
+    # Store as negative feedback with 3x weight (fail-closed)
+    if redis_client is None:
+        logger.error(
+            "ML Feedback LOST: Redis unavailable — cannot store negative feedback for order=%s",
+            order_id,
+        )
+        return
+    try:
+        redis_client.lpush("ml:feedback:negative", json.dumps({
+            "order_id": order_id,
+            "kitchen_id": kitchen_id,
+            "reason": "shelf_expired",
+            "weight": 3,  # 3x weight in training
+            "timestamp": datetime.utcnow().isoformat(),
+        }))
+    except redis_lib.RedisError as exc:
+        logger.error(
+            "ML Feedback LOST: Redis error — cannot store negative feedback for order=%s: %s",
+            order_id, exc,
+        )
 
 
 # ─── FastAPI Lifespan ────────────────────────────────────────
@@ -161,7 +190,13 @@ async def lifespan(app: FastAPI):
         redis_client.ping()
         logger.info("Redis connected: %s", redis_url)
     except Exception as exc:
-        logger.warning("Redis connection failed (non-fatal): %s", exc)
+        # Fail-CLOSED: Redis is REQUIRED for ML feedback storage.
+        # Running without Redis means feedback data WILL be silently lost.
+        logger.error(
+            "Redis connection FAILED — ML feedback storage unavailable: %s. "
+            "Feedback data will be LOST until Redis is restored.",
+            exc,
+        )
         redis_client = None
 
     # Start Kafka consumer for feedback loop

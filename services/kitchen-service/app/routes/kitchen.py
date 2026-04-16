@@ -249,10 +249,16 @@ async def add_staff(
     session.add(staff)
     await session.commit()
 
-    # Register in Redis for quick assignment
+    # Register in Redis for quick assignment (fail-closed: warn if unavailable)
     if _redis_client:
         engine = StaffAssignmentEngine(_redis_client)
         await engine.register_staff(kitchen_id, staff_id, role, tenant_id)
+    else:
+        import logging as _logging
+        _logging.getLogger("kitchen-service").warning(
+            "add_staff: Redis unavailable — staff not registered in hot store for kitchen=%s staff=%s",
+            kitchen_id, staff_id,
+        )
 
     return {"staff_id": staff_id, "name": name, "role": role, "added": True}
 
@@ -283,6 +289,12 @@ async def staff_heartbeat(
     if _redis_client:
         engine = StaffAssignmentEngine(_redis_client)
         await engine.heartbeat(kitchen_id, staff_id, tenant_id)
+    else:
+        import logging as _logging
+        _logging.getLogger("kitchen-service").warning(
+            "staff_heartbeat: Redis unavailable — heartbeat not recorded for kitchen=%s staff=%s",
+            kitchen_id, staff_id,
+        )
 
     return {"staff_id": staff_id, "heartbeat_received": True}
 

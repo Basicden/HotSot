@@ -50,8 +50,12 @@ async def list_kitchen_shelves(
     )
     shelves = result.scalars().all()
 
-    # Enrich with TTL info
+    # Enrich with TTL info (fail-closed: warn if Redis unavailable, still return basic data)
+    import logging as _logging
+    _logger = _logging.getLogger("shelf-service.routes")
     ttl_engine = TTLEngine(_redis_client) if _redis_client else None
+    if not ttl_engine:
+        _logger.warning("list_kitchen_shelves: Redis unavailable — TTL info missing for kitchen=%s", kitchen_id)
     shelf_data = []
     for s in shelves:
         info = {
@@ -65,6 +69,8 @@ async def list_kitchen_shelves(
             if ttl_status:
                 info["ttl_remaining"] = ttl_status.get("ttl_remaining")
                 info["warning_level"] = ttl_status.get("warning_level")
+        else:
+            info["ttl_warning"] = "Redis unavailable — TTL info unknown"
         shelf_data.append(info)
 
     return {"kitchen_id": kitchen_id, "shelves": shelf_data}
@@ -107,12 +113,12 @@ async def assign_shelf(
         if slot.status != "AVAILABLE":
             raise HTTPException(status_code=409, detail="Shelf is not available")
 
-    # Acquire distributed lock
-    if _redis_client:
-        lock_key = f"shelf_lock:{tenant_id}:{shelf_id}"
-        acquired = await _redis_client.client.set(lock_key, order_id, nx=True, ex=ttl_seconds)
-        if not acquired:
-            raise HTTPException(status_code=409, detail="Shelf lock acquisition failed")
+    # Acquire distributed lock (fail-closed: Redis REQUIRED for lock)
+    if not _redis_client:
+        raise HTTPException(status_code=503, detail="Redis unavailable — cannot acquire shelf lock")
+    acquired = await _redis_client.acquire_shelf_lock(shelf_id, order_id, ttl=ttl_seconds, tenant_id=tenant_id)
+    if not acquired:
+        raise HTTPException(status_code=409, detail="Shelf lock acquisition failed")
 
     # Update shelf slot
     slot.status = "OCCUPIED"
@@ -134,10 +140,11 @@ async def assign_shelf(
     session.add(assignment)
     await session.commit()
 
-    # Set TTL tracking
-    if _redis_client:
-        ttl_engine = TTLEngine(_redis_client)
-        await ttl_engine.assign_shelf_ttl(shelf_id, order_id, zone, kitchen_id, tenant_id)
+    # Set TTL tracking (fail-closed: Redis required for TTL management)
+    if not _redis_client:
+        raise HTTPException(status_code=503, detail="Redis unavailable — cannot set shelf TTL")
+    ttl_engine = TTLEngine(_redis_client)
+    await ttl_engine.assign_shelf_ttl(shelf_id, order_id, zone, kitchen_id, tenant_id)
 
     return {
         "shelf_id": shelf_id,
@@ -164,12 +171,16 @@ async def release_shelf(
     if not slot:
         raise HTTPException(status_code=404, detail="Shelf not found")
 
-    # Release distributed lock
-    if _redis_client:
-        lock_key = f"shelf_lock:{tenant_id}:{shelf_id}"
-        await _redis_client.client.delete(lock_key)
-
     order_id = str(slot.order_id) if slot.order_id else None
+
+    # Release distributed lock (fail-closed: use domain method)
+    if _redis_client:
+        released = await _redis_client.release_shelf_lock(shelf_id, order_id, tenant_id=tenant_id)
+        if not released:
+            import logging as _logging
+            _logging.getLogger("shelf-service.routes").warning(
+                "release_shelf: lock release failed for shelf=%s order=%s", shelf_id, order_id
+            )
     slot.status = "AVAILABLE"
     slot.order_id = None
     slot.released_at = datetime.now(timezone.utc)

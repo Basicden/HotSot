@@ -304,6 +304,7 @@ class RedisClient:
             True if TTL extended, False otherwise.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — lock extension DENIED for key={key} (fail-CLOSED)")
             return False
 
         lock_key = f"lock:{key}"
@@ -346,6 +347,7 @@ class RedisClient:
             True if set successfully, False on error.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — cache set DENIED for key={prefix}:{key}")
             return False
 
         cache_key = f"{prefix}:{key}"
@@ -378,6 +380,7 @@ class RedisClient:
             Deserialized value or None if not found / error.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — cache get DENIED for key={prefix}:{key}")
             return None
 
         cache_key = f"{prefix}:{key}"
@@ -404,6 +407,7 @@ class RedisClient:
             True if deleted, False on error.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — cache delete DENIED for key={prefix}:{key}")
             return False
 
         cache_key = f"{prefix}:{key}"
@@ -527,13 +531,19 @@ class RedisClient:
     async def get_shelf_occupant(
         self, shelf_id: str, tenant_id: str = "default"
     ) -> Optional[str]:
-        """Get the order_id currently occupying a shelf."""
+        """Get the order_id currently occupying a shelf.
+
+        Fail-CLOSED: Returns None when Redis is unavailable. Callers must
+        treat None as 'occupant unknown', not 'shelf is free'.
+        """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — get_shelf_occupant DENIED for shelf={shelf_id} tenant={tenant_id}")
             return None
 
         try:
             return await self._client.get(f"lock:{tenant_id}:shelf:{shelf_id}")
-        except RedisError:
+        except RedisError as e:
+            logger.error(f"get_shelf_occupant failed for shelf={shelf_id}: {e}")
             return None
 
     # ═══════════════════════════════════════════════════════════
@@ -552,6 +562,7 @@ class RedisClient:
             True if published, False on error.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — publish DENIED for channel={channel}")
             return False
 
         try:
@@ -575,6 +586,7 @@ class RedisClient:
             PubSub object for consuming messages, or None on error.
         """
         if not self._is_connected():
+            logger.warning(f"Redis unavailable — subscribe DENIED for channels={channels}")
             return None
 
         try:

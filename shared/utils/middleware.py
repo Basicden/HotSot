@@ -211,8 +211,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 )
 
         except Exception as e:
-            # If Redis is down, log but allow (fail-open for rate limit is acceptable)
-            logger.warning(f"Rate limit check failed: {e} — allowing request")
+            # Fail-CLOSED: When Redis is down, DENY the request rather than
+            # silently allowing it.  Bypassing rate limits during an outage
+            # could allow abuse floods that overwhelm downstream services.
+            logger.error(f"Rate limit check failed (Redis unavailable): {e} — DENYING request (fail-CLOSED)")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Rate limiting service unavailable. Please retry later.",
+                    "retry_after_seconds": 30,
+                },
+                headers={"Retry-After": "30"},
+            )
 
         return await call_next(request)
 

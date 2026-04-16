@@ -14,13 +14,15 @@ from shared.utils.middleware import (
 )
 
 from app.core.database import Base
-from app.routes.shelf import router as shelf_router
+from app.core.ttl_worker import TTLWorker
+from app.routes.shelf import router as shelf_router, set_dependencies
 
 settings = get_settings("shelf")
 logger = setup_logging("shelf-service")
 redis_client = RedisClient()
 kafka_producer = KafkaProducer("shelf-service")
 health_checker = HealthChecker("shelf-service")
+ttl_worker = TTLWorker(redis_client, kafka_producer)
 
 
 @asynccontextmanager
@@ -28,9 +30,19 @@ async def lifespan(app: FastAPI):
     await init_service_db("shelf", Base.metadata)
     await redis_client.connect()
     await kafka_producer.start()
+
+    # Wire session factory + redis client into route module
+    from shared.utils.database import get_session_factory
+    session_factory = get_session_factory("shelf")
+    set_dependencies(session_factory, redis_client)
+
+    # Start TTL background worker
+    await ttl_worker.start()
+
     health_checker.mark_ready(True)
     logger.info("shelf_service_started")
     yield
+    await ttl_worker.stop()
     await kafka_producer.stop()
     await redis_client.disconnect()
     health_checker.mark_ready(False)

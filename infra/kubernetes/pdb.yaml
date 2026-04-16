@@ -1,0 +1,54 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: hotsot
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+  namespace: hotsot
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: order-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kitchen-service-pdb
+  namespace: hotsot
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: kitchen-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shelf-service-pdb
+  namespace: hotsot
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: shelf-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: compensation-service-pdb
+  namespace: hotsot
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: compensation-service

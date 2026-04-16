@@ -60,16 +60,22 @@ async def detect_arrival(
     """
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
-    # Deduplication
+    # Deduplication (fail-closed: Redis unavailable → treated as duplicate)
     dedup = ArrivalDeduplicator(_redis_client)
-    if await dedup.is_duplicate(user_id, order_id, time.time(), tenant_id):
-        return {"order_id": order_id, "status": "duplicate", "message": "Already processed"}
+    try:
+        if await dedup.is_duplicate(user_id, order_id, time.time(), tenant_id):
+            return {"order_id": order_id, "status": "duplicate", "message": "Already processed"}
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Deduplication service unavailable")
 
-    # Check idempotency key
+    # Check idempotency key (fail-closed: Redis unavailable → 503)
     if idempotency_key:
-        cached = await dedup.check_idempotency_key(idempotency_key, tenant_id)
-        if cached:
-            return {"order_id": order_id, "status": "cached", "cached_response": cached}
+        try:
+            cached = await dedup.check_idempotency_key(idempotency_key, tenant_id)
+            if cached:
+                return {"order_id": order_id, "status": "cached", "cached_response": cached}
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="Idempotency service unavailable")
 
     # Calculate distance
     distance_meters = None
@@ -143,7 +149,7 @@ async def detect_arrival(
             },
         )
 
-    # Store idempotency response
+    # Store idempotency response (fail-closed: Redis unavailable → 503)
     response_data = {
         "order_id": order_id,
         "is_valid": is_valid,
@@ -151,11 +157,14 @@ async def detect_arrival(
         "proximity": classify_proximity(distance_meters) if distance_meters else "IMMEDIATE",
         "signal_type": signal_type,
     }
-    if idempotency_key and _redis_client:
+    if idempotency_key:
         import json
-        await dedup.store_idempotency_key(
-            idempotency_key, json.dumps(response_data), tenant_id
-        )
+        try:
+            await dedup.store_idempotency_key(
+                idempotency_key, json.dumps(response_data), tenant_id
+            )
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="Idempotency storage unavailable")
 
     return response_data
 

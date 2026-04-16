@@ -124,27 +124,53 @@ class ETAPredictor:
             features_used=features,
         )
 
-        # Cache in Redis
+        # Cache in Redis (fail-closed: log warning if unavailable)
         if self._redis:
             cache_key = f"eta:{kitchen_id}:{order_id}"
-            await self._redis.client.setex(
-                cache_key, 120,
-                json.dumps({
-                    "eta_seconds": eta_seconds,
-                    "risk_level": risk_level,
-                    "confidence": confidence,
-                })
+            try:
+                await self._redis.client.setex(
+                    cache_key, 120,
+                    json.dumps({
+                        "eta_seconds": eta_seconds,
+                        "risk_level": risk_level,
+                        "confidence": confidence,
+                    })
+                )
+            except Exception as exc:
+                logger.warning(
+                    "predict: Failed to cache ETA prediction — order=%s kitchen=%s: %s",
+                    order_id, kitchen_id, exc,
+                )
+        else:
+            logger.warning(
+                "predict: Redis unavailable — ETA prediction not cached for order=%s kitchen=%s",
+                order_id, kitchen_id,
             )
 
         return prediction
 
     async def get_cached_prediction(self, kitchen_id: str, order_id: str) -> Optional[Dict]:
-        """Get cached ETA prediction from Redis."""
+        """Get cached ETA prediction from Redis.
+
+        Fail-CLOSED: Returns None with WARNING when Redis is unavailable.
+        Callers must treat None as a cache miss and recompute.
+        """
         if not self._redis:
+            logger.warning(
+                "get_cached_prediction: Redis unavailable — cache miss for order=%s kitchen=%s",
+                order_id, kitchen_id,
+            )
             return None
         cache_key = f"eta:{kitchen_id}:{order_id}"
-        data = await self._redis.client.get(cache_key)
-        return json.loads(data) if data else None
+        try:
+            data = await self._redis.client.get(cache_key)
+            return json.loads(data) if data else None
+        except Exception as exc:
+            logger.warning(
+                "get_cached_prediction: Redis error — cache miss for order=%s kitchen=%s: %s",
+                order_id, kitchen_id, exc,
+            )
+            return None
 
     @staticmethod
     def _calculate_item_complexity(items: List[Dict]) -> int:

@@ -1,0 +1,128 @@
+name: HotSot Production Deployment
+
+on:
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Deploy to Production
+  # ──────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "latest"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply K8s manifests
+        run: |
+          kubectl apply -f infra/kubernetes/
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/order-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/kitchen-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/shelf-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/eta-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/notification-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/realtime-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/ml-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/arrival-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/compensation-service -n hotsot --timeout=300s
+          kubectl rollout status deployment/api-gateway -n hotsot --timeout=300s
+
+      - name: Run production health checks
+        run: |
+          echo "Running production health checks..."
+          SERVICES=(
+            api-gateway
+            order-service
+            kitchen-service
+            shelf-service
+            eta-service
+            notification-service
+            realtime-service
+            ml-service
+            arrival-service
+            compensation-service
+            vendor-service
+            menu-service
+            search-service
+            pricing-service
+            compliance-service
+            billing-service
+            analytics-service
+            config-service
+          )
+
+          FAILED=0
+          for SERVICE in "${SERVICES[@]}"; do
+            echo "Checking ${SERVICE}..."
+            if kubectl exec -n hotsot deployment/${SERVICE} -- curl -sf http://localhost:8000/health 2>/dev/null; then
+              echo "  ✅ ${SERVICE} is healthy"
+            else
+              echo "  ❌ ${SERVICE} health check failed"
+              FAILED=1
+            fi
+          done
+
+          if [ $FAILED -ne 0 ]; then
+            echo "::warning::Some health checks failed"
+          fi
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "🚀 HotSot Production Deployment Succeeded",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *HotSot Production Deployment Succeeded*\n*Release:* ${{ github.event.release.tag_name }}\n*Deployed by:* ${{ github.actor }}\n*Commit:* ${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "❌ HotSot Production Deployment Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *HotSot Production Deployment Failed*\n*Release:* ${{ github.event.release.tag_name }}\n*Deployed by:* ${{ github.actor }}\n*Commit:* ${{ github.sha }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

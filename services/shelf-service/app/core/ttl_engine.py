@@ -1,9 +1,17 @@
-"""HotSot Shelf Service — TTL Engine for shelf expiry management."""
+"""HotSot Shelf Service — TTL Engine for shelf expiry management (Fail-CLOSED).
+
+All methods propagate RedisError to callers, who are responsible for
+returning appropriate HTTP error responses. Redis failures during TTL
+management are critical — they affect order expiry tracking and
+compensation triggers.
+"""
 
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
+
+from redis.exceptions import RedisError
 
 from shared.utils.helpers import now_ts
 
@@ -21,6 +29,10 @@ class TTLEngine:
     - 75% TTL: WARNING (staff notification)
     - 90% TTL: CRITICAL (auto-escalation)
     - 100% TTL: EXPIRED (compensation triggered)
+
+    Fail-CLOSED: All methods raise on Redis errors rather than silently
+    returning empty/default values. Callers must handle RedisError and
+    return appropriate error responses.
     """
 
     def __init__(self, redis_client):
@@ -29,7 +41,12 @@ class TTLEngine:
     async def assign_shelf_ttl(self, shelf_id: str, order_id: str,
                                 zone: str, kitchen_id: str,
                                 tenant_id: str) -> Dict[str, Any]:
-        """Set TTL tracking for a shelf assignment."""
+        """Set TTL tracking for a shelf assignment.
+
+        Raises:
+            RedisError: If Redis is unavailable. Caller must handle this
+                and return an error response.
+        """
         ttl = SHELF_TTL_SECONDS.get(zone, 600)
         key = f"shelf_ttl:{tenant_id}:{shelf_id}"
 
@@ -46,13 +63,33 @@ class TTLEngine:
             "warning_90_sent": False,
         }
 
-        await self._redis.client.setex(key, ttl + 60, json.dumps(data))
-        return data
+        try:
+            await self._redis.client.setex(key, ttl + 60, json.dumps(data))
+            return data
+        except RedisError as exc:
+            logger.error(
+                "assign_shelf_ttl: Redis error — TTL not set for shelf=%s order=%s: %s",
+                shelf_id, order_id, exc,
+            )
+            raise
 
     async def check_shelf_status(self, shelf_id: str, tenant_id: str) -> Optional[Dict]:
-        """Check current shelf TTL status."""
+        """Check current shelf TTL status.
+
+        Raises:
+            RedisError: If Redis is unavailable. Caller must handle this
+                and return an error response.
+        """
         key = f"shelf_ttl:{tenant_id}:{shelf_id}"
-        data = await self._redis.client.get(key)
+        try:
+            data = await self._redis.client.get(key)
+        except RedisError as exc:
+            logger.error(
+                "check_shelf_status: Redis error — cannot check shelf=%s: %s",
+                shelf_id, exc,
+            )
+            raise
+
         if not data:
             return None
 
@@ -71,26 +108,51 @@ class TTLEngine:
         }
 
     async def get_expired_shelves(self, kitchen_id: str, tenant_id: str) -> List[Dict]:
-        """Find all expired shelves for a kitchen."""
+        """Find all expired shelves for a kitchen.
+
+        Raises:
+            RedisError: If Redis is unavailable. Caller must handle this
+                and return an error response.
+        """
         pattern = f"shelf_ttl:{tenant_id}:*"
         expired = []
 
-        async for key in self._redis.client.scan_iter(match=pattern):
-            data = await self._redis.client.get(key)
-            if data:
-                info = json.loads(data)
-                if info.get("kitchen_id") == kitchen_id:
-                    remaining = info["ttl_seconds"] - (now_ts() - info["assigned_at"])
-                    if remaining <= 0:
-                        expired.append(info)
+        try:
+            async for key in self._redis.client.scan_iter(match=pattern):
+                data = await self._redis.client.get(key)
+                if data:
+                    info = json.loads(data)
+                    if info.get("kitchen_id") == kitchen_id:
+                        remaining = info["ttl_seconds"] - (now_ts() - info["assigned_at"])
+                        if remaining <= 0:
+                            expired.append(info)
+        except RedisError as exc:
+            logger.error(
+                "get_expired_shelves: Redis error — cannot scan for kitchen=%s: %s",
+                kitchen_id, exc,
+            )
+            raise
 
         return expired
 
     async def extend_ttl(self, shelf_id: str, tenant_id: str,
                          additional_seconds: int = WARM_STATION_EXTENSION) -> bool:
-        """Extend shelf TTL (warm station)."""
+        """Extend shelf TTL (warm station).
+
+        Raises:
+            RedisError: If Redis is unavailable. Caller must handle this
+                and return an error response.
+        """
         key = f"shelf_ttl:{tenant_id}:{shelf_id}"
-        data = await self._redis.client.get(key)
+        try:
+            data = await self._redis.client.get(key)
+        except RedisError as exc:
+            logger.error(
+                "extend_ttl: Redis error — cannot extend shelf=%s: %s",
+                shelf_id, exc,
+            )
+            raise
+
         if not data:
             return False
 
@@ -101,7 +163,15 @@ class TTLEngine:
         info["warning_75_sent"] = False
         info["warning_90_sent"] = False
 
-        await self._redis.client.setex(key, info["ttl_seconds"] + 60, json.dumps(info))
+        try:
+            await self._redis.client.setex(key, info["ttl_seconds"] + 60, json.dumps(info))
+        except RedisError as exc:
+            logger.error(
+                "extend_ttl: Redis error — cannot save extended TTL for shelf=%s: %s",
+                shelf_id, exc,
+            )
+            raise
+
         return True
 
     @staticmethod

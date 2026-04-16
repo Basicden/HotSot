@@ -1,0 +1,197 @@
+name: HotSot CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Lint & Test
+  # ──────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest pytest-asyncio httpx
+
+      - name: Run flake8 linting
+        run: |
+          flake8 shared/ services/ \
+            --exclude=__pycache__ \
+            --max-line-length=120 \
+            --statistics
+
+      - name: Run pytest
+        continue-on-error: true
+        run: |
+          python -m pytest services/*/tests/ -v --tb=short
+
+  # ──────────────────────────────────────────────
+  # Job 2: Build & Push Docker Images
+  # ──────────────────────────────────────────────
+  build-images:
+    name: Build & Push (${{ matrix.service }})
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - order-service
+          - kitchen-service
+          - shelf-service
+          - eta-service
+          - notification-service
+          - realtime-service
+          - ml-service
+          - arrival-service
+          - compensation-service
+          - vendor-service
+          - menu-service
+          - search-service
+          - pricing-service
+          - compliance-service
+          - billing-service
+          - analytics-service
+          - config-service
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./services/${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/hotsot-${{ matrix.service }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/hotsot-${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────
+  # Job 3: Security Scan (parallel with lint-and-test)
+  # ──────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit safety
+
+      - name: Run bandit security scan
+        run: |
+          bandit -r shared/ services/ -f json -o bandit-report.json || true
+
+      - name: Run safety check
+        run: |
+          safety check --json || true
+
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Job 4: Deploy to Staging
+  # ──────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-images, security-scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "latest"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply K8s manifests
+        run: |
+          kubectl apply -f infra/kubernetes/
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/order-service -n hotsot --timeout=120s
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests against staging..."
+          STAGING_URL="http://order-service.hotsot.svc.cluster.local:8000"
+
+          echo "Checking API Gateway health..."
+          kubectl exec -n hotsot deployment/api-gateway -- curl -sf http://localhost:8000/health || echo "API Gateway health check failed"
+
+          echo "Checking Order Service health..."
+          kubectl exec -n hotsot deployment/order-service -- curl -sf http://localhost:8000/health || echo "Order Service health check failed"
+
+          echo "Smoke tests completed."

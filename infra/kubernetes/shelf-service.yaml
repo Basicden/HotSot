@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: shelf-service
+  namespace: hotsot
   labels:
     app: shelf-service
 spec:
@@ -31,13 +32,13 @@ spec:
             memory: "512Mi"
         livenessProbe:
           httpGet:
-            path: /health
+            path: /health/live
             port: 8003
           initialDelaySeconds: 15
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /health
+            path: /health/ready
             port: 8003
           initialDelaySeconds: 5
           periodSeconds: 5
@@ -46,6 +47,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: shelf-service
+  namespace: hotsot
 spec:
   type: ClusterIP
   selector:

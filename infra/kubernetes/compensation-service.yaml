@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: compensation-service
+  namespace: hotsot
   labels:
     app: compensation-service
 spec:
@@ -18,7 +19,7 @@ spec:
       - name: compensation-service
         image: hotsot/compensation-service:latest
         ports:
-        - containerPort: 8010
+        - containerPort: 8009
         envFrom:
         - configMapRef:
             name: hotsot-config
@@ -31,14 +32,14 @@ spec:
             memory: "512Mi"
         livenessProbe:
           httpGet:
-            path: /health
-            port: 8010
+            path: /health/live
+            port: 8009
           initialDelaySeconds: 15
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /health
-            port: 8010
+            path: /health/ready
+            port: 8009
           initialDelaySeconds: 5
           periodSeconds: 5
 ---
@@ -46,10 +47,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: compensation-service
+  namespace: hotsot
 spec:
   type: ClusterIP
   selector:
     app: compensation-service
   ports:
-  - port: 8010
-    targetPort: 8010
+  - port: 8009
+    targetPort: 8009

@@ -1,0 +1,98 @@
+name: HotSot PR Quality Gates
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: PR Lint — Stricter linting + code quality checks
+  # ──────────────────────────────────────────────
+  pr-lint:
+    name: PR Lint & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Run flake8 with stricter settings
+        run: |
+          flake8 shared/ services/ \
+            --exclude=__pycache__ \
+            --max-line-length=100 \
+            --max-complexity=10 \
+            --statistics
+
+      - name: Check for TODO/FIXME/HACK comments
+        run: |
+          echo "Searching for TODO/FIXME/HACK comments..."
+          FOUND=0
+
+          rg -n "TODO|FIXME|HACK" shared/ services/ --glob "!__pycache__" || FOUND=$?
+
+          if [ $FOUND -eq 0 ]; then
+            echo "::warning::Found TODO/FIXME/HACK comments in the codebase. Please resolve them before merging."
+          else
+            echo "No TODO/FIXME/HACK comments found. Great!"
+          fi
+
+      - name: Check for debug print statements
+        run: |
+          echo "Searching for debug print statements..."
+          FOUND=0
+
+          # Search for bare print() calls in Python files (excluding test directories)
+          rg -n "^\s*print\s*\(" shared/ services/ \
+            --glob "!__pycache__" \
+            --glob "!**/tests/**" \
+            --glob "!**/migrations/**" || FOUND=$?
+
+          if [ $FOUND -eq 0 ]; then
+            echo "::error::Found debug print statements in production code. Please remove them or use proper logging."
+            exit 1
+          else
+            echo "No debug print statements found. Great!"
+          fi
+
+  # ──────────────────────────────────────────────
+  # Job 2: PR Type Check — Static type analysis
+  # ──────────────────────────────────────────────
+  pr-type-check:
+    name: PR Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install type checking tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install mypy
+
+      - name: Run mypy on shared/ directory
+        continue-on-error: true
+        run: |
+          mypy shared/ \
+            --ignore-missing-imports \
+            --no-strict-optional \
+            --warn-redundant-casts \
+            --warn-unused-ignores \
+            --show-error-codes \
+            --pretty
