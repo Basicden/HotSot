@@ -1,6 +1,7 @@
 """HotSot Menu Service — Routes."""
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,17 +27,18 @@ async def get_session():
         yield session
 
 @router.post("/item")
-async def create_menu_item(name: str, vendor_id: str, price: float, is_veg: bool = True,
+async def create_menu_item(name: str, vendor_id: str, price: Decimal, is_veg: bool = True,
                            category: str = None, batch_category: str = None, prep_time_seconds: int = 300,
                            user: dict = Depends(require_role("vendor_admin")),
                            session: AsyncSession = Depends(get_session)):
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+    price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     item = MenuItemModel(tenant_id=tenant_id, vendor_id=uuid.UUID(vendor_id),
                          name=name, price=price, is_veg=is_veg, category=category,
                          batch_category=batch_category, prep_time_seconds=prep_time_seconds)
     session.add(item)
     await session.commit()
-    return {"item_id": str(item.id), "name": name, "price": price}
+    return {"item_id": str(item.id), "name": name, "price": str(price)}
 
 @router.get("/vendor/{vendor_id}")
 async def get_vendor_menu(vendor_id: str, user: dict = Depends(get_current_user),
@@ -48,7 +50,7 @@ async def get_vendor_menu(vendor_id: str, user: dict = Depends(get_current_user)
                                      MenuItemModel.is_available == True).order_by(MenuItemModel.sort_order))
     items = result.scalars().all()
     return {"vendor_id": vendor_id, "items": [
-        {"item_id": str(i.id), "name": i.name, "price": i.price, "is_veg": i.is_veg, "category": i.category}
+        {"item_id": str(i.id), "name": i.name, "price": str(Decimal(str(i.price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), "is_veg": i.is_veg, "category": i.category}
         for i in items
     ]}
 

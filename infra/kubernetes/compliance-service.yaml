@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compliance-service
+  namespace: hotsot
+  labels:
+    app: hotsot
+    service: compliance-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hotsot
+      service: compliance-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: hotsot
+        service: compliance-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: compliance-service
+        image: hotsot/compliance-service:latest
+        ports:
+        - containerPort: 8014
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: hotsot-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hotsot-secrets
+              key: redis-url
+        - name: KAFKA_BOOTSTRAP
+          valueFrom:
+            configMapKeyRef:
+              name: hotsot-config
+              key: kafka-bootstrap
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8014
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8014
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: compliance-service
+  namespace: hotsot
+  labels:
+    app: hotsot
+    service: compliance-service
+spec:
+  selector:
+    app: hotsot
+    service: compliance-service
+  ports:
+  - port: 8014
+    targetPort: 8014
+  type: ClusterIP

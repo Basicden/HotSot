@@ -363,6 +363,7 @@ class TokenRevocation:
     async def revoke_token(self, jti: str, expires_at: int) -> bool:
         """Add token to blocklist. expires_at is Unix timestamp."""
         if not self._redis:
+            logger.critical("Cannot revoke token: Redis client not configured")
             return False
         try:
             # Store in sorted set with expiry as score for auto-cleanup
@@ -370,18 +371,25 @@ class TokenRevocation:
                 self.BLOCKLIST_KEY, {jti: expires_at}
             )
             return True
-        except Exception:
+        except Exception as e:
+            logger.critical(f"Failed to revoke token jti={jti}: Redis error: {e}")
             return False
 
     async def is_revoked(self, jti: str) -> bool:
-        """Check if a token's jti is in the blocklist."""
+        """Check if a token's jti is in the blocklist.
+
+        Fail-closed: when Redis is unavailable, the token is treated as
+        revoked to prevent unauthorized access during outages.
+        """
         if not self._redis:
-            return False
+            logger.critical("Cannot check token revocation: Redis client not configured — rejecting token (fail-closed)")
+            return True
         try:
             score = await self._redis.client.zscore(self.BLOCKLIST_KEY, jti)
             return score is not None
-        except Exception:
-            return False
+        except Exception as e:
+            logger.critical(f"Redis error checking revocation for jti={jti}: {e} — rejecting token (fail-closed)")
+            return True
 
     async def cleanup_expired(self, current_time: int) -> int:
         """Remove blocklist entries whose tokens have already expired."""
@@ -504,8 +512,20 @@ async def get_current_user(
         )
 
     # ── User-wide revocation check ──
+    # Fail-closed: if Redis is unavailable, we REJECT the token because
+    # we cannot verify it hasn't been revoked at the user level.
     user_id = payload.get("sub")
-    if user_id and token_revocation._redis:
+    if user_id:
+        if not token_revocation._redis:
+            logger.critical(
+                f"Cannot check user-wide revocation for user={user_id}: "
+                "Redis not configured — rejecting token (fail-closed)"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unable to verify token revocation status",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         try:
             user_revoked_key = f"{TokenRevocation.BLOCKLIST_PREFIX}user:{user_id}"
             revoked = await token_revocation._redis.client.get(user_revoked_key)
@@ -517,8 +537,13 @@ async def get_current_user(
                 )
         except HTTPException:
             raise
-        except Exception:
-            logger.warning("Failed to check user-wide revocation — allowing token (fail-open for user blocklist)")
+        except Exception as e:
+            logger.critical(f"Redis error checking user-wide revocation for user={user_id}: {e} — rejecting token (fail-closed)")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unable to verify token revocation status",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     if not user_id:
         raise HTTPException(

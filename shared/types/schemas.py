@@ -396,28 +396,40 @@ class DLQMessage(BaseModel):
 # V2 KAFKA TOPICS (Complete topic taxonomy)
 # ═══════════════════════════════════════════════════════════════
 KAFKA_TOPICS = {
+    # ─── Primary event topics (hotsot.{domain}.events.v1) ─────
     # Order lifecycle topics (partition key: order_id)
-    "hotsot.order.events.v1": "All order lifecycle events — partitioned by order_id for strict ordering",
+    "hotsot.order.events.v1": "All order lifecycle events — ORDER_CREATED through ORDER_PICKED, partitioned by order_id",
     # Kitchen operation topics (partition key: kitchen_id)
-    "hotsot.kitchen.events.v1": "Kitchen execution events — partitioned by kitchen_id",
+    "hotsot.kitchen.events.v1": "Kitchen execution events — PREP_STARTED, PREP_COMPLETED, KITCHEN_OVERLOAD, partitioned by kitchen_id",
     # Slot engine topics (partition key: order_id)
-    "hotsot.slot.events.v1": "Slot reservation and conflict events",
+    "hotsot.slot.events.v1": "Slot reservation and conflict events — SLOT_RESERVED, SLOT_FILLED",
     # Priority engine topics (partition key: order_id)
-    "hotsot.priority.events.v1": "Priority scoring and queue assignment events",
+    "hotsot.priority.events.v1": "Priority scoring and queue assignment events — PRIORITY_UPDATED, QUEUE_ASSIGNED, QUEUE_REORDERED",
     # Shelf management topics (partition key: kitchen_id)
-    "hotsot.shelf.events.v1": "Shelf assignment, TTL, and expiry events",
+    "hotsot.shelf.events.v1": "Shelf assignment, TTL, and expiry events — SHELF_ASSIGNED, SHELF_EXPIRY_WARNING, SHELF_EXPIRED",
     # Arrival detection topics (partition key: order_id)
-    "hotsot.arrival.events.v1": "User arrival and geofence events",
+    "hotsot.arrival.events.v1": "User arrival and geofence events — ARRIVAL_DETECTED, HANDOFF_STARTED, HANDOFF_COMPLETED",
+    # ETA prediction topics (partition key: order_id)
+    "hotsot.eta.events.v1": "ETA prediction and recalculation events — ETA_UPDATED, ETA_RECALCULATED",
+    # Payment topics (partition key: order_id)
+    "hotsot.payment.events.v1": "Payment lifecycle events — PAYMENT_PENDING, PAYMENT_CONFIRMED",
     # Notification topics (partition key: user_id)
     "hotsot.notification.events.v1": "Push, SMS, and in-app notification events",
     # Compensation topics (partition key: order_id)
-    "hotsot.compensation.events.v1": "Refund and compensation events",
+    "hotsot.compensation.events.v1": "Refund and compensation events — COMPENSATION_TRIGGERED, COMPENSATION_COMPLETED",
     # Incident topics (partition key: kitchen_id)
-    "hotsot.incident.events.v1": "Incident detection and escalation events",
-    # DLQ topics
+    "hotsot.incident.events.v1": "Incident detection and escalation events — INCIDENT_DELAY_DETECTED, INCIDENT_ESCALATED",
+    # ─── Dead Letter Queue topics (hotsot.dlq.{domain}.events.v1) ──
     "hotsot.dlq.order.events.v1": "Dead letter queue for order events",
     "hotsot.dlq.kitchen.events.v1": "Dead letter queue for kitchen events",
     "hotsot.dlq.slot.events.v1": "Dead letter queue for slot events",
+    "hotsot.dlq.shelf.events.v1": "Dead letter queue for shelf events",
+    "hotsot.dlq.arrival.events.v1": "Dead letter queue for arrival events",
+    "hotsot.dlq.eta.events.v1": "Dead letter queue for ETA events",
+    "hotsot.dlq.payment.events.v1": "Dead letter queue for payment events",
+    "hotsot.dlq.notification.events.v1": "Dead letter queue for notification events",
+    "hotsot.dlq.compensation.events.v1": "Dead letter queue for compensation events",
+    "hotsot.dlq.incident.events.v1": "Dead letter queue for incident events",
 }
 
 

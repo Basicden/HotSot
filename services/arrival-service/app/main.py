@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from shared.utils.config import get_settings
 from shared.utils.database import init_service_db, get_session_factory
 from shared.utils.redis_client import RedisClient
+from shared.auth.jwt import setup_token_revocation
 from shared.utils.kafka_client import KafkaProducer
 from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
 from shared.utils.middleware import (
@@ -27,6 +28,7 @@ health_checker = HealthChecker("arrival-service")
 async def lifespan(app: FastAPI):
     await init_service_db("arrival", Base.metadata)
     await redis_client.connect()
+    setup_token_revocation(redis_client)
     session_factory = get_session_factory("arrival")
     set_dependencies(session_factory, redis_client, kafka_producer)
     await kafka_producer.start()

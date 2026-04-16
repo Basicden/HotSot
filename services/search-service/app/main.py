@@ -14,6 +14,7 @@ from shared.utils import (
     RedisClient,
     KafkaProducer,
 )
+from shared.auth.jwt import setup_token_revocation
 
 from app.core.database import SearchIndexModel
 from app.routes.search import router as search_router, set_dependencies
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     # Connect Redis
     redis_client = RedisClient(service_name=SERVICE_NAME)
     await redis_client.connect()
+    setup_token_revocation(redis_client)
 
     # Connect Kafka
     kafka_producer = KafkaProducer(service_name=f"{SERVICE_NAME}-service")

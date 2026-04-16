@@ -22,6 +22,7 @@ from shared.utils.config import get_settings
 from shared.utils.database import init_service_db, get_session_factory, dispose_engine
 from shared.utils.redis_client import get_redis_client
 from shared.utils.kafka_client import KafkaProducer
+from shared.auth.jwt import setup_token_revocation
 from shared.utils.observability import (
     setup_tracing,
     setup_logging,
@@ -86,6 +87,7 @@ async def lifespan(app: FastAPI):
     redis_client = get_redis_client(SERVICE_NAME)
     try:
         await redis_client.connect()
+        setup_token_revocation(redis_client)
         logger.info("Redis connected")
     except Exception as e:
         logger.error(f"Redis connection failed: {e} (service will continue with degraded caching)")

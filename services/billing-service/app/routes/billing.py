@@ -50,6 +50,9 @@ async def get_session():
 DEFAULT_COMMISSION_RATE = Decimal("0.15")  # 15% commission
 GST_ON_COMMISSION_RATE = Decimal("0.18")  # 18% GST on commission
 
+# Minimum invoice amount (₹1.00)
+MIN_INVOICE_AMOUNT = Decimal("1.00")
+
 # Payout methods
 VALID_PAYOUT_METHODS = {"BANK_TRANSFER", "UPI", "RAZORPAY_PAYOUT"}
 
@@ -59,12 +62,37 @@ def round_inr(amount: Decimal) -> Decimal:
     return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def validate_invoice_amounts(
+    total_revenue: Decimal,
+    commission_amount: Decimal,
+    gst_amount: Decimal,
+    payout_amount: Decimal,
+) -> None:
+    """
+    Validate that all invoice amounts are positive before saving.
+
+    Raises ValueError if any amount is zero or negative.
+    This prevents creation of zero-amount invoices (Bug #20).
+    """
+    if total_revenue < MIN_INVOICE_AMOUNT:
+        raise ValueError(
+            f"Total revenue ₹{total_revenue} is below minimum invoice amount ₹{MIN_INVOICE_AMOUNT}"
+        )
+    if commission_amount < Decimal("0"):
+        raise ValueError(f"Commission amount cannot be negative: ₹{commission_amount}")
+    if gst_amount < Decimal("0"):
+        raise ValueError(f"GST amount cannot be negative: ₹{gst_amount}")
+    if payout_amount < Decimal("0"):
+        raise ValueError(f"Payout amount cannot be negative: ₹{payout_amount}")
+
+
 @router.post("/invoice/generate")
 async def generate_invoice(
     vendor_id: str,
     period_start: str,
     period_end: str,
-    commission_rate: Optional[float] = None,
+    commission_rate: Optional[Decimal] = None,
+    is_interstate: bool = False,
     user: dict = Depends(require_role("admin", "vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -105,7 +133,10 @@ async def generate_invoice(
     invoice_number = f"INV-{today_str}-{uuid.uuid4().hex[:5].upper()}"
 
     # Use provided commission rate or default
-    comm_rate = Decimal(str(commission_rate)) / 100 if commission_rate else DEFAULT_COMMISSION_RATE
+    if commission_rate is not None:
+        comm_rate = round_inr(commission_rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) / Decimal("100")
+    else:
+        comm_rate = DEFAULT_COMMISSION_RATE
 
     # In a full implementation, we would query the order service for
     # completed orders in this period for this vendor.
@@ -120,6 +151,17 @@ async def generate_invoice(
 
     commission_amount = round_inr(total_revenue * comm_rate)
     gst_on_commission = round_inr(commission_amount * GST_ON_COMMISSION_RATE)
+
+    # GST split: CGST+SGST for intra-state, IGST for inter-state
+    if is_interstate:
+        igst = gst_on_commission
+        cgst = Decimal("0.00")
+        sgst = Decimal("0.00")
+    else:
+        cgst = round_inr(gst_on_commission / 2)
+        sgst = round_inr(gst_on_commission - cgst)  # Avoid rounding drift
+        igst = Decimal("0.00")
+
     payout_amount = round_inr(total_revenue - commission_amount - gst_on_commission)
 
     invoice = InvoiceModel(
@@ -129,11 +171,11 @@ async def generate_invoice(
         period_start=period_start,
         period_end=period_end,
         total_orders=total_orders,
-        total_revenue=float(total_revenue),
-        commission_rate=float(comm_rate * 100),
-        commission_amount=float(commission_amount),
-        gst_amount=float(gst_on_commission),
-        payout_amount=float(payout_amount),
+        total_revenue=str(total_revenue),
+        commission_rate=str(round_inr(comm_rate * 100)),
+        commission_amount=str(commission_amount),
+        gst_amount=str(gst_on_commission),
+        payout_amount=str(payout_amount),
         status="DRAFT",
     )
     session.add(invoice)
@@ -151,13 +193,17 @@ async def generate_invoice(
         "period_start": period_start,
         "period_end": period_end,
         "total_orders": total_orders,
-        "total_revenue": float(total_revenue),
-        "commission_rate_pct": float(comm_rate * 100),
-        "commission_amount": float(commission_amount),
-        "gst_on_commission": float(gst_on_commission),
-        "payout_amount": float(payout_amount),
+        "total_revenue": str(total_revenue),
+        "commission_rate_pct": str(round_inr(comm_rate * 100)),
+        "commission_amount": str(commission_amount),
+        "gst_on_commission": str(gst_on_commission),
+        "cgst": str(cgst),
+        "sgst": str(sgst),
+        "igst": str(igst),
+        "is_interstate": is_interstate,
+        "payout_amount": str(payout_amount),
         "status": "DRAFT",
-        "note": "Invoice created in DRAFT. Populate total_orders and total_revenue, then mark as FINALIZED.",
+        "note": "Invoice created in DRAFT. Populate total_orders and total_revenue, then finalize.",
     }
 
 
@@ -165,7 +211,8 @@ async def generate_invoice(
 async def finalize_invoice(
     invoice_id: str,
     total_orders: int,
-    total_revenue: float,
+    total_revenue: Decimal,
+    is_interstate: bool = False,
     user: dict = Depends(require_role("admin")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -191,19 +238,36 @@ async def finalize_invoice(
         raise HTTPException(status_code=400, detail=f"Cannot finalize invoice in {invoice.status} status")
 
     # Calculate amounts
-    revenue = Decimal(str(total_revenue))
+    revenue = round_inr(total_revenue.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     comm_rate = Decimal(str(invoice.commission_rate)) / 100 if invoice.commission_rate else DEFAULT_COMMISSION_RATE
 
     commission = round_inr(revenue * comm_rate)
     gst = round_inr(commission * GST_ON_COMMISSION_RATE)
+
+    # GST split: CGST+SGST for intra-state, IGST for inter-state
+    if is_interstate:
+        igst = gst
+        cgst = Decimal("0.00")
+        sgst = Decimal("0.00")
+    else:
+        cgst = round_inr(gst / 2)
+        sgst = round_inr(gst - cgst)  # Avoid rounding drift
+        igst = Decimal("0.00")
+
     payout = round_inr(revenue - commission - gst)
+
+    # Validate all amounts are positive (Bug #20 fix)
+    try:
+        validate_invoice_amounts(revenue, commission, gst, payout)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Update invoice
     invoice.total_orders = total_orders
-    invoice.total_revenue = float(revenue)
-    invoice.commission_amount = float(commission)
-    invoice.gst_amount = float(gst)
-    invoice.payout_amount = float(payout)
+    invoice.total_revenue = str(revenue)
+    invoice.commission_amount = str(commission)
+    invoice.gst_amount = str(gst)
+    invoice.payout_amount = str(payout)
     invoice.status = "FINALIZED"
 
     await session.commit()
@@ -213,10 +277,14 @@ async def finalize_invoice(
         "invoice_number": invoice.invoice_number,
         "status": "FINALIZED",
         "total_orders": total_orders,
-        "total_revenue": float(revenue),
-        "commission_amount": float(commission),
-        "gst_on_commission": float(gst),
-        "payout_amount": float(payout),
+        "total_revenue": str(revenue),
+        "commission_amount": str(commission),
+        "gst_on_commission": str(gst),
+        "cgst": str(cgst),
+        "sgst": str(sgst),
+        "igst": str(igst),
+        "is_interstate": is_interstate,
+        "payout_amount": str(payout),
     }
 
 
@@ -262,7 +330,7 @@ async def get_vendor_invoices(
 @router.post("/payout/process")
 async def process_payout(
     vendor_id: str,
-    amount: float,
+    amount: Decimal,
     invoice_id: Optional[str] = None,
     method: str = "BANK_TRANSFER",
     user: dict = Depends(require_role("admin")),
@@ -276,7 +344,7 @@ async def process_payout(
     """
     tenant_id = user.get("tenant_id", "default")
 
-    if amount <= 0:
+    if amount <= Decimal("0"):
         raise HTTPException(status_code=400, detail="Payout amount must be positive")
 
     if method not in VALID_PAYOUT_METHODS:
@@ -300,11 +368,13 @@ async def process_payout(
                 detail="Payout already exists for this invoice",
             )
 
+    payout_amt = round_inr(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
     payout = PayoutModel(
         tenant_id=tenant_id,
         vendor_id=vendor_id,
         invoice_id=invoice_id,
-        amount=amount,
+        amount=str(payout_amt),
         method=method,
         status="PENDING",
     )
@@ -327,7 +397,7 @@ async def process_payout(
                     json={
                         "account_number": "hotsot_escrow_account",
                         "fund_account_id": vendor_id,  # Should be Razorpay fund account ID
-                        "amount": int(amount * 100),  # paise
+                        "amount": int(payout_amt * 100),  # paise
                         "currency": "INR",
                         "mode": "IMPS",
                         "purpose": "payout",
@@ -358,7 +428,7 @@ async def process_payout(
     return {
         "payout_id": str(payout.id),
         "vendor_id": vendor_id,
-        "amount": amount,
+        "amount": str(payout_amt),
         "method": method,
         "status": payout.status,
         "razorpay_payout_id": razorpay_payout_id,

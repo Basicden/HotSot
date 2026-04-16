@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from shared.utils.config import get_settings
 from shared.utils.redis_client import RedisClient
+from shared.auth.jwt import setup_token_revocation
 from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
 from shared.utils.middleware import (
     ErrorHandlingMiddleware, CorrelationIDMiddleware,
@@ -19,6 +20,7 @@ health_checker = HealthChecker("realtime-service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await redis_client.connect()
+    setup_token_revocation(redis_client)
     health_checker.mark_ready(True)
     logger.info("realtime_service_started")
     yield

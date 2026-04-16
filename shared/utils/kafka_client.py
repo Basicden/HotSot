@@ -127,6 +127,9 @@ def _resolve_topic(event_type: EventType) -> str:
     """
     Resolve an EventType to its Kafka topic.
 
+    Uses the KAFKA_TOPICS dict as the canonical source of truth.
+    All topic names follow the convention: hotsot.{domain}.events.v1
+
     Args:
         event_type: The event type enum value.
 
@@ -149,6 +152,14 @@ def _resolve_topic(event_type: EventType) -> str:
     ):
         return "hotsot.kitchen.events.v1"
 
+    # Slot events
+    if et.startswith("SLOT_"):
+        return "hotsot.slot.events.v1"
+
+    # Priority events
+    if et.startswith("PRIORITY_") or et.startswith("QUEUE_"):
+        return "hotsot.priority.events.v1"
+
     # Shelf events
     if "SHELF" in et:
         return "hotsot.shelf.events.v1"
@@ -159,7 +170,11 @@ def _resolve_topic(event_type: EventType) -> str:
 
     # ETA events
     if et.startswith("ETA_") or et == "READY_FOR_PICKUP":
-        return "hotsot.shelf.events.v1"
+        return "hotsot.eta.events.v1"
+
+    # Payment events
+    if et.startswith("PAYMENT_"):
+        return "hotsot.payment.events.v1"
 
     # Compensation events
     if "COMPENSATION" in et:
@@ -330,8 +345,8 @@ class KafkaProducer:
                     f"topic={topic} | error={error} | "
                     f"event_id={event.event_id} type={event.event_type.value}\n"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error during shutdown: {e}")
 
 
 class EventPublisher(KafkaProducer):
@@ -495,8 +510,8 @@ class KafkaConsumer:
                         f"offset={msg.offset} key={msg.key} | "
                         f"error={error} | value={json.dumps(msg.value, default=str)[:500]}\n"
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during shutdown: {e}")
 
             # Clean up retry counter
             self._retry_counts.pop(msg_key, None)

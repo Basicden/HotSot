@@ -9,6 +9,7 @@ from shared.utils.middleware import (
     RequestLoggingMiddleware, RateLimitMiddleware, TenantMiddleware,
 )
 from shared.utils.redis_client import RedisClient
+from shared.auth.jwt import setup_token_revocation
 
 from app.routes.proxy import router as proxy_router
 
@@ -20,6 +21,7 @@ health_checker = HealthChecker("api-gateway")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await redis_client.connect()
+    setup_token_revocation(redis_client)
     health_checker.mark_ready(True)
     logger.info("api_gateway_started")
     yield

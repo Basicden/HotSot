@@ -1,5 +1,6 @@
 """HotSot Compensation Service — Routes."""
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,15 +29,16 @@ async def get_session():
 @router.post("/trigger")
 async def trigger_compensation(
     order_id: str, user_id: str, kitchen_id: str,
-    reason: str, order_amount: float,
+    reason: str, order_amount: Decimal,
     auto_triggered: bool = True,
     user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Trigger compensation for an order issue."""
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+    order_amount = order_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     engine = CompensationEngine(_redis_client, _kafka_producer)
-    comp = engine.calculate_compensation(reason, order_amount, tenant_id)
+    comp = engine.calculate_compensation(reason, str(order_amount), tenant_id)
 
     case = CompensationCaseModel(
         tenant_id=uuid.UUID(tenant_id),

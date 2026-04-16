@@ -1,6 +1,7 @@
 """HotSot Vendor Service — Routes."""
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,7 +48,7 @@ async def get_vendor(vendor_id: str, user: dict = Depends(get_current_user), ses
 
 @router.put("/{vendor_id}")
 async def update_vendor(vendor_id: str, name: str = None, is_active: bool = None,
-                        commission_rate: float = None, tier: str = None,
+                        commission_rate: Decimal = None, tier: str = None,
                         user: dict = Depends(require_role("admin")),
                         session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(VendorModel).where(VendorModel.id == uuid.UUID(vendor_id)))
@@ -56,7 +57,7 @@ async def update_vendor(vendor_id: str, name: str = None, is_active: bool = None
         raise HTTPException(status_code=404, detail="Vendor not found")
     if name: vendor.name = name
     if is_active is not None: vendor.is_active = is_active
-    if commission_rate: vendor.commission_rate = commission_rate
+    if commission_rate: vendor.commission_rate = commission_rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if tier: vendor.tier = tier
     vendor.updated_at = datetime.now(timezone.utc)
     await session.commit()

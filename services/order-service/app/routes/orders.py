@@ -46,7 +46,7 @@ from shared.types.schemas import (
     TIER_WEIGHTS,
     SHELF_TTL_SECONDS,
 )
-from shared.utils.database import get_session_factory, set_tenant_id
+from shared.utils.database import get_session_factory, set_tenant_id, ConcurrentModificationError
 from shared.utils.helpers import (
     generate_id,
     now_iso,
@@ -429,10 +429,17 @@ async def initiate_payment(
             detail=f"Cannot pay: order is {order.status} (expected PAYMENT_PENDING)",
         )
 
+    # Optimistic locking: capture expected version before mutation
+    expected_version = order.version
+
     # Transition: PAYMENT_PENDING → PAYMENT_CONFIRMED
     try:
         order.status = state_machine.transition("PAYMENT_PENDING", "PAYMENT_CONFIRMED")
         order.payment_ref = req.payment_ref
+        # Optimistic lock check
+        if not order.check_version(expected_version):
+            raise ConcurrentModificationError("OrderModel", order_id, expected_version, order.version)
+        order.increment_version()
         await persist_event(
             session, order_id, tenant_id, EventType.PAYMENT_CONFIRMED.value,
             {
@@ -442,7 +449,7 @@ async def initiate_payment(
             },
             idempotency_key_val=req.idempotency_key,
         )
-    except InvalidTransitionError as e:
+    except (InvalidTransitionError, ConcurrentModificationError) as e:
         raise HTTPException(status_code=409, detail=str(e))
 
     # Slot reservation AFTER payment
@@ -987,15 +994,21 @@ async def confirm_handoff(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # Optimistic locking: capture expected version
+    expected_version = order.version
+
     # ARRIVED → HANDOFF_IN_PROGRESS
     if order.status == "ARRIVED":
         try:
             order.status = state_machine.transition("ARRIVED", "HANDOFF_IN_PROGRESS")
+            if not order.check_version(expected_version):
+                raise ConcurrentModificationError("OrderModel", order_id, expected_version, order.version)
+            order.increment_version()
             await persist_event(
                 session, order_id, tenant_id, EventType.HANDOFF_STARTED.value,
                 {"staff_id": req.staff_id, "method": req.confirmation_method},
             )
-        except InvalidTransitionError as e:
+        except (InvalidTransitionError, ConcurrentModificationError) as e:
             raise HTTPException(status_code=409, detail=str(e))
 
     # HANDOFF_IN_PROGRESS → PICKED
@@ -1003,12 +1016,15 @@ async def confirm_handoff(
         try:
             order.status = state_machine.transition("HANDOFF_IN_PROGRESS", "PICKED")
             order.picked_at = datetime.now(timezone.utc)
+            if not order.check_version(expected_version):
+                raise ConcurrentModificationError("OrderModel", order_id, expected_version, order.version)
+            order.increment_version()
             await persist_event(
                 session, order_id, tenant_id, EventType.HANDOFF_COMPLETED.value,
                 {"staff_id": req.staff_id, "method": req.confirmation_method},
                 idempotency_key_val=req.idempotency_key,
             )
-        except InvalidTransitionError as e:
+        except (InvalidTransitionError, ConcurrentModificationError) as e:
             raise HTTPException(status_code=409, detail=str(e))
 
     # Release shelf lock

@@ -105,6 +105,20 @@ class NotificationTemplates:
             "title": "Quality Issue Detected",
             "message": "Your order #{order_id} failed quality check and is being remade. No additional charges.",
         },
+        # ── Payment events ──
+        "payment.success": {
+            "title": "Payment Successful!",
+            "message": "Payment of Rs.{amount} for order #{order_id} was successful. Your order is being processed!",
+        },
+        "payment.failed": {
+            "title": "Payment Failed",
+            "message": "Payment for order #{order_id} failed. Please retry or use a different payment method.",
+        },
+        # ── Shelf events ──
+        "shelf.expiry_warning": {
+            "title": "Pickup Reminder!",
+            "message": "Your order #{order_id} on shelf {shelf_id} expires in {ttl_minutes} minutes. Please pick it up soon!",
+        },
         # ── Kitchen events ──
         "kitchen.new_order": {
             "title": "New Order",
@@ -164,6 +178,18 @@ class NotificationTemplates:
         "order.arrived": {
             "title": "स्वागत है!",
             "message": "ऑर्डर #{order_id} के लिए आपकी आमद का पता चला। आपका खाना तैयार किया जा रहा है!",
+        },
+        "payment.success": {
+            "title": "भुगतान सफल!",
+            "message": "ऑर्डर #{order_id} के लिए Rs.{amount} का भुगतान हो गया। आपका ऑर्डर प्रोसेस हो रहा है!",
+        },
+        "payment.failed": {
+            "title": "भुगतान विफल",
+            "message": "ऑर्डर #{order_id} का भुगतान विफल हो गया। कृपया दोबारा प्रयास करें।",
+        },
+        "shelf.expiry_warning": {
+            "title": "पिकअप रिमाइंडर!",
+            "message": "आपका ऑर्डर #{order_id} शेल्फ {shelf_id} पर {ttl_minutes} मिनट में एक्सपायर होगा। कृपया जल्दी उठा लें!",
         },
     }
 

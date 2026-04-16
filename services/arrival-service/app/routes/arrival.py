@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from shared.auth.jwt import get_current_user
 from shared.utils.helpers import now_iso, generate_id
-from shared.types.schemas import EventType
+from shared.types.schemas import EventType, KAFKA_TOPICS
 
 from app.core.database import ArrivalEventModel
 from app.core.geo import haversine_distance, is_within_geofence, classify_proximity
@@ -127,7 +127,7 @@ async def detect_arrival(
     # Publish arrival event to Kafka
     if _kafka_producer:
         await _kafka_producer.publish(
-            topic="hotsot.arrival.events.v1",
+            topic=KAFKA_TOPICS["hotsot.arrival.events.v1"],
             key=order_id,
             value={
                 "event_id": generate_id(),

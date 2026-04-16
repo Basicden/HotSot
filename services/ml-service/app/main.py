@@ -17,6 +17,9 @@ import redis as redis_lib
 from kafka import KafkaConsumer
 
 from app.routes.ml import router as ml_router
+from shared.auth.jwt import setup_token_revocation
+from shared.utils.redis_client import RedisClient as SharedRedisClient
+from shared.types.schemas import KAFKA_TOPICS, EventType
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(name)s  │  %(message)s")
@@ -28,9 +31,10 @@ _consumer_thread: threading.Thread | None = None
 _consumer_running = False
 
 # Feedback events that improve ETA model accuracy
+# V2: Subscribe to standardized domain topics and filter by event_type
 FEEDBACK_TOPICS = [
-    "order.picked",
-    "shelf.expired",
+    KAFKA_TOPICS["hotsot.order.events.v1"],   # filter: ORDER_PICKED
+    KAFKA_TOPICS["hotsot.shelf.events.v1"],   # filter: SHELF_EXPIRED
 ]
 
 
@@ -70,9 +74,11 @@ def _kafka_consumer_loop():
                 if not order_id:
                     continue
 
-                if msg.topic == "order.picked":
+                # V2: Filter by event_type instead of topic name
+                event_type = event.get("event_type", "")
+                if event_type == EventType.ORDER_PICKED.value:
                     _handle_order_picked(event)
-                elif msg.topic == "shelf.expired":
+                elif event_type == EventType.SHELF_EXPIRED.value:
                     _handle_shelf_expired(event)
 
         except StopIteration:
@@ -82,8 +88,8 @@ def _kafka_consumer_loop():
 
     try:
         consumer.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Error during shutdown: {e}")
     logger.info("ML Kafka consumer stopped")
 
 
@@ -199,6 +205,15 @@ async def lifespan(app: FastAPI):
         )
         redis_client = None
 
+    # Initialize shared RedisClient for JWT token revocation
+    jwt_redis_client = SharedRedisClient(service_name="ml")
+    try:
+        await jwt_redis_client.connect()
+        setup_token_revocation(jwt_redis_client)
+        logger.info("JWT token revocation Redis connected")
+    except Exception as exc:
+        logger.error("JWT token revocation Redis connection failed: %s", exc)
+
     # Start Kafka consumer for feedback loop
     _consumer_running = True
     _consumer_thread = threading.Thread(target=_kafka_consumer_loop, daemon=True)
@@ -213,8 +228,8 @@ async def lifespan(app: FastAPI):
     if redis_client:
         try:
             redis_client.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error during shutdown: {e}")
     logger.info("MLService shutting down …")
 
 

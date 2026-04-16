@@ -12,7 +12,10 @@ Key features:
     - Database initialization helpers
 
 Usage:
-    from shared.utils.database import get_engine, get_session_factory, TenantBase, init_service_db
+    from shared.utils.database import (
+        get_engine, get_session_factory, TenantBase, init_service_db,
+        ConcurrentModificationError, OptimisticLockMixin, optimistic_update,
+    )
 
     # In your service startup:
     engine = get_engine("order")
@@ -34,9 +37,12 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Column,
+    Integer,
     String,
     DateTime,
     Index,
+    select,
+    update as sa_update,
     text,
     event,
 )
@@ -54,6 +60,43 @@ from fastapi import Request
 from shared.utils.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMISTIC LOCKING EXCEPTION
+# ═══════════════════════════════════════════════════════════════
+
+class ConcurrentModificationError(Exception):
+    """
+    Raised when an optimistic lock version check fails.
+
+    This indicates that the record was modified by another transaction
+    between the time it was read and the time an update was attempted.
+
+    Attributes:
+        model_name: Name of the model class.
+        record_id: Primary key of the conflicting record.
+        expected_version: The version the caller expected.
+        actual_version: The version currently in the database.
+    """
+    def __init__(
+        self,
+        model_name: str,
+        record_id: Any = None,
+        expected_version: int = None,
+        actual_version: int = None,
+    ):
+        self.model_name = model_name
+        self.record_id = record_id
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        msg = (
+            f"Concurrent modification detected for {model_name}"
+            f" id={record_id}" if record_id else f"Concurrent modification detected for {model_name}"
+        )
+        if expected_version is not None:
+            msg += f": expected version={expected_version}, actual version={actual_version}"
+        super().__init__(msg)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -116,10 +159,19 @@ class BaseModel(TenantBase):
     )
     version = Column(
         "version",
+        Integer,
         default=1,
         nullable=False,
         comment="Optimistic locking version — increment on every update",
     )
+
+    def check_version(self, expected: int) -> bool:
+        """Check that the current version matches the expected value."""
+        return self.version == expected
+
+    def increment_version(self) -> None:
+        """Increment the optimistic locking version counter."""
+        self.version += 1
 
 
 class BaseModelMixin(BaseModel):
@@ -130,6 +182,96 @@ class BaseModelMixin(BaseModel):
     This class ensures both imports work identically.
     """
     pass
+
+
+class OptimisticLockMixin:
+    """
+    Standalone mixin for optimistic locking via version column.
+
+    Use this mixin for models that do NOT inherit from BaseModel
+    but still need optimistic locking support.
+
+    Usage in SQLAlchemy models:
+        class OrderModel(Base, OptimisticLockMixin):
+            __tablename__ = "orders"
+            # ... other columns
+
+    Before saving:
+        if not model.check_version(expected_version):
+            raise ConcurrentModificationError(...)
+        model.increment_version()
+    """
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+
+    def check_version(self, expected: int) -> bool:
+        """Check that the current version matches the expected value."""
+        return self.version == expected
+
+    def increment_version(self) -> None:
+        """Increment the optimistic locking version counter."""
+        self.version += 1
+
+
+async def optimistic_update(
+    session: AsyncSession,
+    model_class: Type[TenantBase],
+    record_id: Any,
+    expected_version: int,
+    updates: dict,
+) -> Any:
+    """
+    Perform an optimistic update with database-level version checking.
+
+    This function atomically checks the version and applies updates
+    using a conditional UPDATE statement with a WHERE clause on version.
+    If the version in the database no longer matches expected_version,
+    no rows are updated and ConcurrentModificationError is raised.
+
+    Steps:
+        1. Issues a conditional UPDATE with version check
+        2. Verifies exactly one row was affected
+        3. Reloads and returns the updated record
+
+    Args:
+        session: The async database session.
+        model_class: The SQLAlchemy model class.
+        record_id: Primary key of the record to update.
+        expected_version: The version the caller expects.
+        updates: Dict of column_name → new_value to apply.
+
+    Returns:
+        The updated model instance.
+
+    Raises:
+        ConcurrentModificationError: If version mismatch (rowcount == 0).
+    """
+    update_values = {**updates, "version": expected_version + 1}
+    stmt = (
+        sa_update(model_class)
+        .where(
+            model_class.id == record_id,
+            model_class.version == expected_version,
+        )
+        .values(**update_values)
+    )
+    result = await session.execute(stmt)
+
+    if result.rowcount == 0:
+        # Version mismatch — record was modified by another transaction
+        raise ConcurrentModificationError(
+            model_name=model_class.__name__,
+            record_id=record_id,
+            expected_version=expected_version,
+            actual_version=None,  # Unknown without re-reading
+        )
+
+    await session.flush()
+
+    # Reload the updated record
+    refreshed = await session.execute(
+        select(model_class).where(model_class.id == record_id)
+    )
+    return refreshed.scalar_one()
 
 
 # ═══════════════════════════════════════════════════════════════

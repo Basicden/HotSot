@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from shared.utils.helpers import generate_id, now_iso
+from shared.types.schemas import KAFKA_TOPICS
 
 logger = logging.getLogger("compensation-service.engine")
 
@@ -65,7 +66,7 @@ class CompensationEngine:
         # Publish compensation event
         if self._kafka:
             await self._kafka.publish(
-                topic="hotsot.compensation.events.v1",
+                topic=KAFKA_TOPICS["hotsot.compensation.events.v1"],
                 key=order_id,
                 value={
                     "event_id": generate_id(),

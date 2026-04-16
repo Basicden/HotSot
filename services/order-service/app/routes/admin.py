@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -124,7 +125,7 @@ async def get_stats(
     for row in payment_result.all():
         payment_stats[row[0]] = {
             "count": row[1],
-            "total_amount": float(row[2]) if row[2] else 0.0,
+            "total_amount": Decimal(str(row[2])) if row[2] else Decimal("0"),
         }
 
     # Active sagas (from in-memory engine)

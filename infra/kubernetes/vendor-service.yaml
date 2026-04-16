@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vendor-service
+  namespace: hotsot
+  labels:
+    app: hotsot
+    service: vendor-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hotsot
+      service: vendor-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: hotsot
+        service: vendor-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: vendor-service
+        image: hotsot/vendor-service:latest
+        ports:
+        - containerPort: 8010
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: hotsot-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hotsot-secrets
+              key: redis-url
+        - name: KAFKA_BOOTSTRAP
+          valueFrom:
+            configMapKeyRef:
+              name: hotsot-config
+              key: kafka-bootstrap
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8010
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8010
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vendor-service
+  namespace: hotsot
+  labels:
+    app: hotsot
+    service: vendor-service
+spec:
+  selector:
+    app: hotsot
+    service: vendor-service
+  ports:
+  - port: 8010
+    targetPort: 8010
+  type: ClusterIP

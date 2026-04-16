@@ -96,8 +96,8 @@ async def create_pricing_rule(
     vendor_id: str,
     rule_type: str,
     name: str,
-    multiplier: float = 1.0,
-    flat_amount: float = 0.0,
+    multiplier: Decimal = Decimal("1.0"),
+    flat_amount: Decimal = Decimal("0.0"),
     conditions: Optional[dict] = None,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
@@ -127,21 +127,21 @@ async def create_pricing_rule(
     rule_config = RULE_TYPES[rule_type]
 
     # Validate multiplier bounds
-    if multiplier <= 0:
+    if multiplier <= Decimal("0"):
         raise HTTPException(status_code=400, detail="Multiplier must be positive")
 
-    if multiplier > rule_config["max_multiplier"]:
+    if multiplier > Decimal(str(rule_config["max_multiplier"])):
         raise HTTPException(
             status_code=400,
             detail=f"Multiplier {multiplier} exceeds max {rule_config['max_multiplier']} for {rule_type}",
         )
 
     # Validate surge rules: multiplier must be >= 1.0
-    if rule_type == "SURGE" and multiplier < 1.0:
+    if rule_type == "SURGE" and multiplier < Decimal("1.0"):
         raise HTTPException(status_code=400, detail="Surge multiplier must be >= 1.0")
 
     # Validate discount rules: multiplier must be <= 1.0
-    if rule_type == "DISCOUNT" and multiplier > 1.0:
+    if rule_type == "DISCOUNT" and multiplier > Decimal("1.0"):
         raise HTTPException(status_code=400, detail="Discount multiplier must be <= 1.0")
 
     # Set priority if not provided
@@ -182,7 +182,7 @@ async def create_pricing_rule(
 @router.post("/calculate")
 async def calculate_price(
     vendor_id: str,
-    base_amount: float,
+    base_amount: Decimal,
     user_tier: str = "FREE",
     time_of_day: Optional[int] = None,
     user: dict = Depends(get_current_user),
@@ -209,7 +209,7 @@ async def calculate_price(
     """
     tenant_id = user.get("tenant_id", "default")
 
-    if base_amount <= 0:
+    if base_amount <= Decimal("0"):
         raise HTTPException(status_code=400, detail="Base amount must be positive")
 
     # Fetch all active rules for this vendor
@@ -222,7 +222,7 @@ async def calculate_price(
     )
     rules = result.scalars().all()
 
-    base = Decimal(str(base_amount))
+    base = base_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     current_amount = base
     applied_rules: List[Dict[str, Any]] = []
     surge_applied = False
@@ -251,8 +251,8 @@ async def calculate_price(
                 "rule_id": str(rule.id),
                 "rule_name": rule.name,
                 "type": "SURGE",
-                "multiplier": float(multiplier),
-                "adjustment": float(current_amount - prev),
+                "multiplier": str(multiplier),
+                "adjustment": str(current_amount - prev),
             })
 
         elif rule.rule_type == "TIME_BASED":
@@ -262,8 +262,8 @@ async def calculate_price(
                 "rule_id": str(rule.id),
                 "rule_name": rule.name,
                 "type": "TIME_BASED",
-                "multiplier": float(multiplier),
-                "adjustment": float(current_amount - prev),
+                "multiplier": str(multiplier),
+                "adjustment": str(current_amount - prev),
             })
 
         elif rule.rule_type == "DISCOUNT":
@@ -282,9 +282,9 @@ async def calculate_price(
                 "rule_id": str(rule.id),
                 "rule_name": rule.name,
                 "type": "DISCOUNT",
-                "multiplier": float(multiplier),
-                "flat_adjustment": float(flat),
-                "adjustment": float(current_amount - prev),
+                "multiplier": str(multiplier),
+                "flat_adjustment": str(flat),
+                "adjustment": str(current_amount - prev),
             })
 
         elif rule.rule_type == "TIER_DISCOUNT":
@@ -297,9 +297,9 @@ async def calculate_price(
                 "rule_name": rule.name,
                 "type": "TIER_DISCOUNT",
                 "tier": user_tier,
-                "multiplier": float(multiplier),
-                "flat_adjustment": float(flat),
-                "adjustment": float(current_amount - prev),
+                "multiplier": str(multiplier),
+                "flat_adjustment": str(flat),
+                "adjustment": str(current_amount - prev),
             })
 
         elif rule.rule_type == "HAPPY_HOUR":
@@ -311,9 +311,9 @@ async def calculate_price(
                 "rule_id": str(rule.id),
                 "rule_name": rule.name,
                 "type": "HAPPY_HOUR",
-                "multiplier": float(multiplier),
-                "flat_adjustment": float(flat),
-                "adjustment": float(current_amount - prev),
+                "multiplier": str(multiplier),
+                "flat_adjustment": str(flat),
+                "adjustment": str(current_amount - prev),
             })
 
     # Apply price bounds
@@ -329,15 +329,15 @@ async def calculate_price(
         bounded = True
 
     return {
-        "base_amount": base_amount,
-        "final_amount": float(current_amount),
+        "base_amount": str(base),
+        "final_amount": str(current_amount),
         "applied_rules": applied_rules,
         "rules_count": len(applied_rules),
         "surge_applied": surge_applied,
-        "total_discount_pct": float(total_discount_pct),
+        "total_discount_pct": str(total_discount_pct),
         "price_bounded": bounded,
-        "min_price": float(min_price),
-        "max_price": float(max_price),
+        "min_price": str(min_price),
+        "max_price": str(max_price),
     }
 
 
@@ -410,8 +410,8 @@ async def list_pricing_rules(
             "rule_id": str(r.id),
             "name": r.name,
             "rule_type": r.rule_type,
-            "multiplier": float(r.multiplier) if r.multiplier else None,
-            "flat_amount": float(r.flat_amount) if r.flat_amount else None,
+            "multiplier": str(r.multiplier) if r.multiplier else None,
+            "flat_amount": str(r.flat_amount) if r.flat_amount else None,
             "priority": r.priority,
             "is_active": r.is_active,
             "start_time": r.start_time,

@@ -26,6 +26,7 @@ class Channel(str, Enum):
     WEBSOCKET = "WEBSOCKET"
     PUSH = "PUSH"
     SMS = "SMS"
+    EMAIL = "EMAIL"
     IN_APP = "IN_APP"
 
 
@@ -41,6 +42,7 @@ class ChannelRouter:
         self._ws_clients: Dict[str, list] = {}  # user_id → [websocket refs]
         self._push_tokens: Dict[str, str] = {}   # user_id → FCM/APNs token
         self._phone_numbers: Dict[str, str] = {}  # user_id → phone number
+        self._email_addresses: Dict[str, str] = {}  # user_id → email address
         self._in_app_store: Dict[str, list] = {}  # user_id → [notifications]
 
     async def send(
@@ -74,6 +76,8 @@ class ChannelRouter:
             return await self._send_push(user_id, title, message, data)
         elif channel == Channel.SMS:
             return await self._send_sms(user_id, title, message, data)
+        elif channel == Channel.EMAIL:
+            return await self._send_email(user_id, title, message, data)
         elif channel == Channel.IN_APP:
             return await self._send_in_app(user_id, title, message, data)
         else:
@@ -226,6 +230,33 @@ class ChannelRouter:
     def register_phone(self, user_id: str, phone: str) -> None:
         """Register a user's phone number for SMS."""
         self._phone_numbers[user_id] = phone
+
+    def register_email(self, user_id: str, email: str) -> None:
+        """Register a user's email address for EMAIL channel."""
+        self._email_addresses[user_id] = email
+
+    async def _send_email(
+        self, user_id: str, title: str, message: str, data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Send via email (mock SMTP/SES).
+
+        In production, this would:
+          1. Look up user's email address from Redis/DB
+          2. Send via AWS SES or SMTP relay
+          3. Track delivery and bounce status
+        """
+        email = self._email_addresses.get(user_id)
+        if not email:
+            logger.info("Email: No email address for user %s, will fallback", user_id)
+            raise ChannelDeliveryError(f"No email address for user {user_id}")
+
+        # Mock SMTP/SES send
+        logger.info("Email → user=%s email=%s: %s", user_id, email[:3] + "****", title)
+        return {
+            "channel": Channel.EMAIL.value,
+            "status": "DELIVERED_EMAIL",
+            "smtp_message_id": f"email_{hash(email) % 100000}",
+        }
 
 
 class ChannelDeliveryError(Exception):

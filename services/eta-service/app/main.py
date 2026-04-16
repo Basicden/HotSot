@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from shared.utils.config import get_settings
 from shared.utils.database import init_service_db
 from shared.utils.redis_client import RedisClient
+from shared.auth.jwt import setup_token_revocation
 from shared.utils.kafka_client import KafkaProducer
 from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
 from shared.utils.middleware import (
@@ -27,6 +28,7 @@ health_checker = HealthChecker("eta-service")
 async def lifespan(app: FastAPI):
     await init_service_db("eta", Base.metadata)
     await redis_client.connect()
+    setup_token_revocation(redis_client)
     await kafka_producer.start()
     health_checker.mark_ready(True)
     logger.info("eta_service_started")

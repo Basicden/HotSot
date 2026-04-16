@@ -1,10 +1,19 @@
-"""HotSot Search Service — Routes."""
+"""HotSot Search Service — Routes.
+
+V2: PostgreSQL full-text search with GIN/tsvector, pagination,
+    relevance ranking, and multi-faceted filtering.
+
+Search Strategy:
+    1. Primary: tsvector @@ tsquery (fast, GIN-indexed, linguistically aware)
+    2. Fallback: ilike partial match (catches substrings tsvector misses)
+    3. Results are ranked by ts_rank (relevance) then popularity_score
+"""
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional, List
+from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, and_, or_, desc, literal_column
 from shared.auth.jwt import get_current_user, require_role
 from app.core.database import SearchIndexModel
 
@@ -25,46 +34,289 @@ async def get_session():
     async with _session_factory() as session:
         yield session
 
+
+def _build_tsvector_expr():
+    """Build a tsvector expression from searchable columns.
+
+    Uses the GIN-indexed 'search_tsvector' column if available (post-migration),
+    otherwise falls back to inline to_tsvector() computation.
+    """
+    # Inline tsvector: combines name, description, cuisine, and tags
+    return func.to_tsvector(
+        'english',
+        func.coalesce(SearchIndexModel.name, '') + ' ' +
+        func.coalesce(SearchIndexModel.description, '') + ' ' +
+        func.coalesce(SearchIndexModel.cuisine, '') + ' ' +
+        func.coalesce(
+            func.array_to_string(SearchIndexModel.tags, ' '), ''
+        )
+    )
+
+
 @router.get("/")
-async def search(q: str, entity_type: str = None, cuisine: str = None,
-                 city: str = None, limit: int = 20,
-                 user: dict = Depends(get_current_user),
-                 session: AsyncSession = Depends(get_session)):
-    """Full-text search across vendors, menu items, kitchens."""
+async def search(
+    q: Optional[str] = Query(None, description="Search query text"),
+    entity_type: Optional[str] = Query(None, description="Entity type: VENDOR, MENU_ITEM, KITCHEN"),
+    cuisine: Optional[str] = Query(None, description="Cuisine filter (e.g. North Indian, Chinese)"),
+    city: Optional[str] = Query(None, description="City filter"),
+    vendor_id: Optional[str] = Query(None, description="Filter by vendor UUID"),
+    category: Optional[str] = Query(None, description="Category filter (e.g. Biryani, Burger)"),
+    price_min: Optional[float] = Query(None, description="Minimum price in INR", ge=0),
+    price_max: Optional[float] = Query(None, description="Maximum price in INR", ge=0),
+    dietary: Optional[str] = Query(None, description="Dietary preference: VEG, NON_VEG, VEGAN, EGGETARIAN"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Full-text search across vendors, menu items, kitchens.
+
+    Uses PostgreSQL GIN/tsvector for fast linguistic search with ilike
+    fallback for partial substring matches. Results are ranked by
+    tsvector relevance score and popularity.
+
+    Pagination: Use limit/offset. Response includes total count.
+    """
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    query = select(SearchIndexModel).where(
+
+    # ─── Build base conditions ────────────────────────────────
+    conditions = [
         SearchIndexModel.tenant_id == tenant_id,
         SearchIndexModel.is_available == True,
-    )
-    if q:
-        query = query.where(SearchIndexModel.name.ilike(f"%{q}%"))
+    ]
+
+    # ─── Apply filters ────────────────────────────────────────
     if entity_type:
-        query = query.where(SearchIndexModel.entity_type == entity_type)
+        conditions.append(SearchIndexModel.entity_type == entity_type)
     if cuisine:
-        query = query.where(SearchIndexModel.cuisine == cuisine)
+        conditions.append(SearchIndexModel.cuisine == cuisine)
     if city:
-        query = query.where(SearchIndexModel.city == city)
-    query = query.order_by(SearchIndexModel.popularity_score.desc()).limit(limit)
+        conditions.append(SearchIndexModel.city == city)
+    if vendor_id:
+        try:
+            conditions.append(SearchIndexModel.vendor_id == uuid.UUID(vendor_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid vendor_id format")
+    if category:
+        conditions.append(SearchIndexModel.category == category)
+    if dietary:
+        valid_dietary = {"VEG", "NON_VEG", "VEGAN", "EGGETARIAN"}
+        dietary_upper = dietary.upper()
+        if dietary_upper not in valid_dietary:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid dietary preference. Must be one of: {valid_dietary}",
+            )
+        conditions.append(SearchIndexModel.dietary_preference == dietary_upper)
+    if price_min is not None:
+        conditions.append(
+            or_(
+                SearchIndexModel.price_max >= price_min,
+                SearchIndexModel.price_max.is_(None),
+            )
+        )
+    if price_max is not None:
+        conditions.append(
+            or_(
+                SearchIndexModel.price_min <= price_max,
+                SearchIndexModel.price_min.is_(None),
+            )
+        )
+
+    # ─── Full-text search with ilike fallback ─────────────────
+    rank_expr = None
+    if q:
+        # tsvector expression: prefer the GIN-indexed column if populated
+        tsvector_expr = func.coalesce(
+            SearchIndexModel.search_tsvector,
+            _build_tsvector_expr(),
+        )
+
+        # plainto_tsquery safely converts user input to tsquery
+        # (handles special characters, no injection risk)
+        tsquery_expr = func.plainto_tsquery('english', q)
+
+        # Relevance ranking score
+        rank_expr = func.ts_rank(tsvector_expr, tsquery_expr).label('rank')
+
+        # Combine tsvector match with ilike fallback for partial matches
+        # tsvector is fast but misses substring patterns like "bir" → "biryani"
+        search_conditions = or_(
+            tsvector_expr.op('@@')(tsquery_expr),
+            SearchIndexModel.name.ilike(f"%{q}%"),
+            SearchIndexModel.description.ilike(f"%{q}%"),
+        )
+        conditions.append(search_conditions)
+
+    # ─── Build count query (for pagination metadata) ──────────
+    count_query = select(func.count(SearchIndexModel.id)).where(and_(*conditions))
+    count_result = await session.execute(count_query)
+    total = count_result.scalar() or 0
+
+    # ─── Build main query ─────────────────────────────────────
+    if rank_expr is not None:
+        query = select(SearchIndexModel, rank_expr).where(and_(*conditions))
+    else:
+        query = select(SearchIndexModel).where(and_(*conditions))
+
+    # ─── Ordering: relevance first, then popularity ───────────
+    if rank_expr is not None:
+        query = query.order_by(
+            desc(rank_expr),
+            desc(SearchIndexModel.popularity_score),
+        )
+    else:
+        query = query.order_by(desc(SearchIndexModel.popularity_score))
+
+    # ─── Pagination ───────────────────────────────────────────
+    query = query.limit(limit).offset(offset)
+
     result = await session.execute(query)
-    items = result.scalars().all()
-    return {"query": q, "results": [
-        {"entity_type": i.entity_type, "entity_id": str(i.entity_id), "name": i.name, "cuisine": i.cuisine}
-        for i in items
-    ]}
+
+    # ─── Format results ───────────────────────────────────────
+    items = []
+    if rank_expr is not None:
+        rows = result.all()
+        for row in rows:
+            i = row[0]  # SearchIndexModel instance
+            rank = row[1]  # ts_rank score
+            items.append(_format_result(i, rank))
+    else:
+        scalars = result.scalars().all()
+        for i in scalars:
+            items.append(_format_result(i, None))
+
+    return {
+        "query": q,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+        "results": items,
+    }
+
+
+def _format_result(item: SearchIndexModel, rank: Optional[float]) -> dict:
+    """Format a search result with scoring information."""
+    result = {
+        "entity_type": item.entity_type,
+        "entity_id": str(item.entity_id),
+        "name": item.name,
+        "description": item.description,
+        "cuisine": item.cuisine,
+        "category": item.category,
+        "city": item.city,
+        "dietary_preference": item.dietary_preference,
+        "price_min": item.price_min,
+        "price_max": item.price_max,
+        "popularity_score": item.popularity_score,
+        "relevance_score": round(float(rank), 4) if rank else 0.0,
+        "tags": item.tags or [],
+    }
+    # Only include vendor_id when it's set
+    if item.vendor_id:
+        result["vendor_id"] = str(item.vendor_id)
+    return result
+
 
 @router.post("/index")
-async def index_entity(entity_type: str, entity_id: str, name: str,
-                       description: str = None, cuisine: str = None,
-                       tags: list = None, city: str = None,
-                       user: dict = Depends(get_current_user),
-                       session: AsyncSession = Depends(get_session)):
-    """Add or update entity in search index."""
+async def index_entity(
+    entity_type: str,
+    entity_id: str,
+    name: str,
+    description: str = None,
+    cuisine: str = None,
+    tags: list = None,
+    city: str = None,
+    vendor_id: str = None,
+    category: str = None,
+    price_min: float = None,
+    price_max: float = None,
+    dietary: str = None,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Add or update entity in search index.
+
+    Supports full metadata including vendor, category, price range,
+    and dietary preferences for filtered search.
+    """
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    # Validate dietary preference
+    if dietary:
+        valid_dietary = {"VEG", "NON_VEG", "VEGAN", "EGGETARIAN"}
+        dietary_upper = dietary.upper()
+        if dietary_upper not in valid_dietary:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid dietary preference. Must be one of: {valid_dietary}",
+            )
+        dietary = dietary_upper
+
+    # Validate price range
+    if price_min is not None and price_max is not None and price_min > price_max:
+        raise HTTPException(
+            status_code=400,
+            detail="price_min cannot be greater than price_max",
+        )
+
     idx = SearchIndexModel(
-        tenant_id=tenant_id, entity_type=entity_type,
-        entity_id=uuid.UUID(entity_id), name=name, description=description,
-        cuisine=cuisine, tags=tags or [], city=city,
+        tenant_id=tenant_id,
+        entity_type=entity_type,
+        entity_id=uuid.UUID(entity_id),
+        vendor_id=uuid.UUID(vendor_id) if vendor_id else None,
+        name=name,
+        description=description,
+        cuisine=cuisine,
+        tags=tags or [],
+        city=city,
+        category=category,
+        price_min=price_min,
+        price_max=price_max,
+        dietary_preference=dietary,
     )
     session.add(idx)
     await session.commit()
     return {"indexed": True, "entity_id": entity_id}
+
+
+@router.get("/suggest")
+async def suggest(
+    q: str = Query(..., min_length=1, max_length=100, description="Prefix for autocomplete"),
+    entity_type: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Autocomplete suggestions for search input.
+
+    Uses ilike prefix matching for fast autocomplete.
+    Not full-text — designed for type-ahead UI.
+    """
+    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    conditions = [
+        SearchIndexModel.tenant_id == tenant_id,
+        SearchIndexModel.is_available == True,
+        SearchIndexModel.name.ilike(f"{q}%"),  # Prefix match for autocomplete
+    ]
+    if entity_type:
+        conditions.append(SearchIndexModel.entity_type == entity_type)
+
+    query = (
+        select(SearchIndexModel.name, SearchIndexModel.entity_type, SearchIndexModel.cuisine)
+        .where(and_(*conditions))
+        .order_by(desc(SearchIndexModel.popularity_score))
+        .limit(limit)
+    )
+    result = await session.execute(query)
+    rows = result.all()
+
+    return {
+        "query": q,
+        "suggestions": [
+            {"name": r[0], "entity_type": r[1], "cuisine": r[2]}
+            for r in rows
+        ],
+    }
