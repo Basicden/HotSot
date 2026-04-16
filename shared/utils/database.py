@@ -49,6 +49,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from fastapi import Request
+
 from shared.utils.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ class BaseModel(TenantBase):
     - tenant_id: Multi-tenant isolation key (indexed, NOT NULL)
     - created_at: Creation timestamp (UTC)
     - updated_at: Last update timestamp (UTC, auto-updated)
+    - version: Optimistic locking version counter
 
     Usage:
         class OrderModel(BaseModel):
@@ -111,6 +114,22 @@ class BaseModel(TenantBase):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+    version = Column(
+        "version",
+        default=1,
+        nullable=False,
+        comment="Optimistic locking version — increment on every update",
+    )
+
+
+class BaseModelMixin(BaseModel):
+    """
+    Alias for BaseModel — provides backward compatibility.
+
+    Some services import BaseModelMixin instead of BaseModel.
+    This class ensures both imports work identically.
+    """
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -334,9 +353,22 @@ def create_db_dependency(service_name: str):
     """
     session_factory = get_session_factory(service_name)
 
-    async def get_db():
+    async def get_db(request: Request = None):
         async with session_factory() as session:
             try:
+                # Set tenant_id for RLS if available in request context
+                if request is not None:
+                    tenant_id = None
+                    # Try request.state first (set by TenantMiddleware)
+                    if hasattr(request, "state") and hasattr(request.state, "tenant_id"):
+                        tenant_id = request.state.tenant_id
+                    # Fallback: try X-Tenant-ID header
+                    if not tenant_id:
+                        tenant_id = request.headers.get("X-Tenant-ID")
+
+                    if tenant_id:
+                        await set_tenant_id(session, tenant_id)
+
                 yield session
                 await session.commit()
             except Exception:

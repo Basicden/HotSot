@@ -10,10 +10,14 @@ from app.core.database import SearchIndexModel
 
 router = APIRouter()
 _session_factory = None
+_redis_client = None
+_kafka_producer = None
 
 def set_dependencies(session_factory, redis_client=None, kafka_producer=None):
-    global _session_factory
+    global _session_factory, _redis_client, _kafka_producer
     _session_factory = session_factory
+    _redis_client = redis_client
+    _kafka_producer = kafka_producer
 
 async def get_session():
     if _session_factory is None:
@@ -29,7 +33,7 @@ async def search(q: str, entity_type: str = None, cuisine: str = None,
     """Full-text search across vendors, menu items, kitchens."""
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
     query = select(SearchIndexModel).where(
-        SearchIndexModel.tenant_id == uuid.UUID(tenant_id),
+        SearchIndexModel.tenant_id == tenant_id,
         SearchIndexModel.is_available == True,
     )
     if q:
@@ -57,7 +61,7 @@ async def index_entity(entity_type: str, entity_id: str, name: str,
     """Add or update entity in search index."""
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
     idx = SearchIndexModel(
-        tenant_id=uuid.UUID(tenant_id), entity_type=entity_type,
+        tenant_id=tenant_id, entity_type=entity_type,
         entity_id=uuid.UUID(entity_id), name=name, description=description,
         cuisine=cuisine, tags=tags or [], city=city,
     )

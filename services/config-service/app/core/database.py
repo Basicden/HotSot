@@ -3,12 +3,12 @@ import uuid
 from datetime import datetime, timezone
 from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, Text, Index
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
-from shared.utils.database import Base as SharedBase, BaseModelMixin
+from shared.utils.database import BaseModel
 
 class Base(SharedBase):
     pass
 
-class ConfigModel(Base, BaseModelMixin):
+class ConfigModel(BaseModel):
     __tablename__ = "service_configs"
     id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(PG_UUID(as_uuid=True), nullable=False, index=True)
@@ -24,3 +24,7 @@ class ConfigModel(Base, BaseModelMixin):
     __table_args__ = (
         Index("idx_config_tenant_service_key", "tenant_id", "service_name", "config_key", unique=True),
     )
+
+
+# Model list for DB init
+ALL_MODELS = [ConfigModel]

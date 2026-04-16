@@ -10,10 +10,14 @@ from app.core.database import MenuItemModel, MenuCategoryModel
 
 router = APIRouter()
 _session_factory = None
+_redis_client = None
+_kafka_producer = None
 
 def set_dependencies(session_factory, redis_client=None, kafka_producer=None):
-    global _session_factory
+    global _session_factory, _redis_client, _kafka_producer
     _session_factory = session_factory
+    _redis_client = redis_client
+    _kafka_producer = kafka_producer
 
 async def get_session():
     if _session_factory is None:
@@ -27,7 +31,7 @@ async def create_menu_item(name: str, vendor_id: str, price: float, is_veg: bool
                            user: dict = Depends(require_role("vendor_admin")),
                            session: AsyncSession = Depends(get_session)):
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    item = MenuItemModel(tenant_id=uuid.UUID(tenant_id), vendor_id=uuid.UUID(vendor_id),
+    item = MenuItemModel(tenant_id=tenant_id, vendor_id=uuid.UUID(vendor_id),
                          name=name, price=price, is_veg=is_veg, category=category,
                          batch_category=batch_category, prep_time_seconds=prep_time_seconds)
     session.add(item)
@@ -40,7 +44,7 @@ async def get_vendor_menu(vendor_id: str, user: dict = Depends(get_current_user)
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
     result = await session.execute(
         select(MenuItemModel).where(MenuItemModel.vendor_id == uuid.UUID(vendor_id),
-                                     MenuItemModel.tenant_id == uuid.UUID(tenant_id),
+                                     MenuItemModel.tenant_id == tenant_id,
                                      MenuItemModel.is_available == True).order_by(MenuItemModel.sort_order))
     items = result.scalars().all()
     return {"vendor_id": vendor_id, "items": [

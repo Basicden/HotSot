@@ -3,61 +3,60 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from shared.utils.config import get_settings
-from shared.utils.database import init_service_db
-from shared.utils.redis_client import RedisClient
-from shared.utils.kafka_client import KafkaProducer
-from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
-from shared.utils.middleware import (
-    ErrorHandlingMiddleware, CorrelationIDMiddleware,
-    RequestLoggingMiddleware, RateLimitMiddleware, TenantMiddleware,
+from shared.utils import (
+    setup_logging,
+    setup_tracing,
+    setup_middleware,
+    get_session_factory,
+    init_service_db,
+    dispose_engine,
+    create_health_router,
+    RedisClient,
+    KafkaProducer,
 )
 
-from app.core.database import Base
-from app.routes.vendor import router as vendor_router
+from app.core.database import VendorModel, VendorDocumentModel
+from app.routes.vendor import router as vendor_router, set_dependencies
 
-settings = get_settings("vendor")
-logger = setup_logging("vendor-service")
-redis_client = RedisClient()
-kafka_producer = KafkaProducer("vendor-service")
-health_checker = HealthChecker("vendor-service")
+SERVICE_NAME = "vendor"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_service_db("vendor", Base.metadata)
+    # Setup observability
+    setup_logging(f"{SERVICE_NAME}-service")
+    setup_tracing(f"{SERVICE_NAME}-service", app)
+
+    # Initialize database
+    session_factory = get_session_factory(SERVICE_NAME)
+    await init_service_db(SERVICE_NAME, [VendorModel, VendorDocumentModel])
+
+    # Connect Redis
+    redis_client = RedisClient(service_name=SERVICE_NAME)
     await redis_client.connect()
+
+    # Connect Kafka
+    kafka_producer = KafkaProducer(service_name=f"{SERVICE_NAME}-service")
     await kafka_producer.start()
-    health_checker.mark_ready(True)
-    logger.info("vendor_service_started")
+
+    # Wire dependencies into routes
+    set_dependencies(session_factory, redis_client, kafka_producer)
+
     yield
+
+    # Cleanup
     await kafka_producer.stop()
     await redis_client.disconnect()
-    health_checker.mark_ready(False)
+    await dispose_engine(SERVICE_NAME)
 
 
 app = FastAPI(title="HotSot Vendor Service", version="2.0.0", lifespan=lifespan)
 
-app.add_middleware(ErrorHandlingMiddleware)
-app.add_middleware(CorrelationIDMiddleware)
-app.add_middleware(RequestLoggingMiddleware)
-app.add_middleware(RateLimitMiddleware, redis_client=redis_client, requests_per_minute=120)
-app.add_middleware(TenantMiddleware)
-setup_tracing("vendor-service", app)
+# Middleware
+setup_middleware(app, SERVICE_NAME)
 
+# Health checks
+app.include_router(create_health_router(SERVICE_NAME))
+
+# Business routes
 app.include_router(vendor_router, prefix="/vendor", tags=["vendor"])
-
-
-@app.get("/health/live")
-async def liveness():
-    return health_checker.liveness()
-
-@app.get("/health/ready")
-async def readiness():
-    db_ok = await health_checker.check_db("vendor")
-    redis_ok = await health_checker.check_redis(redis_client)
-    return health_checker.readiness(db_ok=db_ok, redis_ok=redis_ok)
-
-@app.get("/health/startup")
-async def startup():
-    return health_checker.startup()

@@ -10,10 +10,14 @@ from app.core.database import VendorModel, VendorDocumentModel
 
 router = APIRouter()
 _session_factory = None
+_redis_client = None
+_kafka_producer = None
 
 def set_dependencies(session_factory, redis_client=None, kafka_producer=None):
-    global _session_factory
+    global _session_factory, _redis_client, _kafka_producer
     _session_factory = session_factory
+    _redis_client = redis_client
+    _kafka_producer = kafka_producer
 
 async def get_session():
     if _session_factory is None:
@@ -26,7 +30,7 @@ async def register_vendor(name: str, email: str, phone: str, gstin: str = None,
                           fssai_license: str = None, user: dict = Depends(require_role("admin")),
                           session: AsyncSession = Depends(get_session)):
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    vendor = VendorModel(tenant_id=uuid.UUID(tenant_id), name=name, email=email,
+    vendor = VendorModel(tenant_id=tenant_id, name=name, email=email,
                          phone=phone, gstin=gstin, fssai_license=fssai_license)
     session.add(vendor)
     await session.commit()
@@ -63,6 +67,6 @@ async def list_vendors(skip: int = 0, limit: int = 20, user: dict = Depends(get_
                        session: AsyncSession = Depends(get_session)):
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
     result = await session.execute(
-        select(VendorModel).where(VendorModel.tenant_id == uuid.UUID(tenant_id)).offset(skip).limit(limit))
+        select(VendorModel).where(VendorModel.tenant_id == tenant_id).offset(skip).limit(limit))
     vendors = result.scalars().all()
     return {"vendors": [{"vendor_id": str(v.id), "name": v.name, "tier": v.tier, "is_active": v.is_active} for v in vendors]}

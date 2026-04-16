@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, Float, DateTime, Index, Text,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
+from sqlalchemy.dialects.postgresql import Numeric, UUID as PG_UUID, JSONB
 from sqlalchemy.orm import Mapped
 
 from shared.utils.database import BaseModel
@@ -69,7 +69,7 @@ class OrderModel(BaseModel):
     eta_risk = Column(String(20), default="LOW", comment="ETA risk level: LOW/MEDIUM/HIGH/CRITICAL")
 
     items = Column(JSONB, default=list, comment="Order items as JSONB array")
-    total_amount = Column(Float, nullable=True, comment="Total order amount in INR")
+    total_amount = Column(Numeric(10, 2), nullable=True, comment="Total order amount in INR")
 
     payment_method = Column(String(30), default="UPI", comment="Payment method: UPI/CARD/WALLET/COD")
     payment_ref = Column(String(100), nullable=True, comment="External payment reference")
@@ -191,7 +191,7 @@ class PaymentModel(BaseModel):
         nullable=True,
         comment="Gateway transaction ID (e.g., Razorpay payment ID)",
     )
-    amount = Column(Float, nullable=False, comment="Payment amount in INR")
+    amount = Column(Numeric(10, 2), nullable=False, comment="Payment amount in INR")
     currency = Column(String(3), default="INR", comment="Currency code")
     status = Column(
         String(20),

@@ -127,8 +127,11 @@ async def get_stats(
             "total_amount": float(row[2]) if row[2] else 0.0,
         }
 
-    # Active sagas
-    active_sagas = await order_saga.get_active_sagas(tenant_id=tenant_id)
+    # Active sagas (from in-memory engine)
+    active_sagas = [
+        saga for saga in order_saga._active_sagas.values()
+        if saga.get("tenant_id") == tenant_id and saga.get("status") == "RUNNING"
+    ]
 
     # Average time from CREATED to PICKED
     avg_time_result = await session.execute(
@@ -173,7 +176,10 @@ async def get_sagas(
     tenant_id = user.get("tenant_id", "default")
 
     # Get in-memory active sagas
-    sagas = await order_saga.get_active_sagas(tenant_id=tenant_id)
+    sagas = [
+        saga for saga in order_saga._active_sagas.values()
+        if saga.get("tenant_id") == tenant_id and saga.get("status") in ("RUNNING", "COMPENSATING")
+    ]
 
     # Also query persisted sagas
     await set_tenant_id(session, tenant_id)
@@ -190,7 +196,7 @@ async def get_sagas(
     db_sagas = result.scalars().all()
 
     # Combine results
-    in_memory = [s.get_progress() for s in sagas]
+    in_memory = sagas  # Already dicts from _active_sagas
     persisted = [{
         "saga_id": str(s.id),
         "order_id": str(s.order_id),
