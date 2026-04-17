@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import compliance_check
 from shared.money import Money
 from app.core.database import CompensationCaseModel, CompensationRuleModel
 from app.core.engine import CompensationEngine
@@ -32,10 +33,13 @@ async def get_session():
         yield session
 
 @router.post("/trigger")
+@compliance_check("RBI")
 async def trigger_compensation(
     order_id: str, user_id: str, kitchen_id: str,
     reason: str, order_amount: Decimal,
     auto_triggered: bool = True,
+    vendor_id: str = None,
+    tenant_id: str = None,
     user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -44,8 +48,12 @@ async def trigger_compensation(
     Uses Money class for order_amount handling to ensure
     Decimal-based precision. Compensation amounts are stored
     via Money.to_db() for database serialization.
+
+    Compliance: @compliance_check("RBI") — soft gate verifies RBI compliance
+    status before processing refunds. Logs warning if PENDING, blocks if FAILED.
     """
-    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+    if tenant_id is None:
+        tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
 
     # Convert order_amount to Money for precise handling
     order_money = Money(order_amount)

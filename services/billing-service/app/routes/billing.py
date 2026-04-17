@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import compliance_check, require_compliance
 from shared.utils.helpers import generate_id, now_iso
 from shared.money import (
     Money,
@@ -64,6 +65,7 @@ VALID_PAYOUT_METHODS = {"BANK_TRANSFER", "UPI", "RAZORPAY_PAYOUT"}
 
 
 @router.post("/invoice/generate")
+@compliance_check("GST")
 async def generate_invoice(
     vendor_id: str,
     period_start: str,
@@ -71,6 +73,7 @@ async def generate_invoice(
     commission_rate: Optional[Decimal] = None,
     is_interstate: bool = False,
     allow_zero_draft: bool = False,
+    tenant_id: str = None,
     user: dict = Depends(require_role("admin", "vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -87,8 +90,12 @@ async def generate_invoice(
 
     When no order data is provided, returns a 400 error instead of
     creating a zero-amount draft (Bug #20 fix).
+
+    Compliance: @compliance_check("GST") — soft gate verifies vendor GST
+    status before generating invoices. Logs warning if PENDING, blocks if FAILED.
     """
-    tenant_id = user.get("tenant_id", "default")
+    if tenant_id is None:
+        tenant_id = user.get("tenant_id", "default")
 
     if not vendor_id or not period_start or not period_end:
         raise HTTPException(
@@ -318,11 +325,13 @@ async def get_vendor_invoices(
 
 
 @router.post("/payout/process")
+@require_compliance("RBI")
 async def process_payout(
     vendor_id: str,
     amount: Decimal,
     invoice_id: Optional[str] = None,
     method: str = "BANK_TRANSFER",
+    tenant_id: str = None,
     user: dict = Depends(require_role("admin")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -332,8 +341,12 @@ async def process_payout(
     Creates a payout record and (optionally) triggers Razorpay payout.
     Payout states: PENDING -> PROCESSING -> COMPLETED / FAILED
     Uses Money.to_paise() for Razorpay amount conversion.
+
+    Compliance: @require_compliance("RBI") — hard gate requires RBI compliance
+    PASSED before processing payouts. Blocks if not PASSED.
     """
-    tenant_id = user.get("tenant_id", "default")
+    if tenant_id is None:
+        tenant_id = user.get("tenant_id", "default")
 
     # Convert to Money for validation and precision
     payout_money = Money(amount)

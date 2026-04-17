@@ -28,6 +28,7 @@ from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.jwt import get_current_user, require_tenant
+from shared.compliance_decorators import compliance_check
 from shared.types.schemas import (
     EventEnvelope,
     EventType,
@@ -273,8 +274,11 @@ async def _auto_assign_shelf(
 # 1. CREATE ORDER (CREATED → PAYMENT_PENDING)
 # ═══════════════════════════════════════════════════════════════
 @router.post("/create")
+@compliance_check("FSSAI")
 async def create_order(
     req: OrderCreateRequest,
+    vendor_id: str = None,
+    tenant_id: str = None,
     user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
     producer=Depends(get_kafka_producer),
@@ -287,8 +291,12 @@ async def create_order(
     - Stores idempotency_key for dedup
     - Emits ORDER_CREATED event
     - Transitions to PAYMENT_PENDING (waits for payment before slot)
+
+    Compliance: @compliance_check("FSSAI") — soft gate verifies vendor FSSAI
+    status before accepting orders. Logs warning if PENDING, blocks if FAILED.
     """
-    tenant_id = user.get("tenant_id", req.tenant_id)
+    if tenant_id is None:
+        tenant_id = user.get("tenant_id", req.tenant_id)
 
     # Set tenant context for RLS
     await set_tenant_id(session, tenant_id)

@@ -21,11 +21,14 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import require_compliance
 from shared.money import Money
 from shared.payment_gateway import RazorpayGateway, PaymentState, PaymentGatewayError
 from shared.utils.config import get_settings
+from shared.utils.database import get_session_factory, set_tenant_id
 from shared.utils.helpers import generate_id, now_iso
 
 logger = logging.getLogger(__name__)
@@ -36,9 +39,25 @@ router = APIRouter()
 _gateway = RazorpayGateway()
 
 
+async def get_db():
+    """Database session dependency for compliance checks."""
+    session_factory = get_session_factory("order")
+    async with session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
 @router.post("/init")
+@require_compliance("RBI")
 async def init_payment(
     request: Request,
+    vendor_id: str = None,
+    tenant_id: str = None,
+    session: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -49,12 +68,16 @@ async def init_payment(
 
     Amount conversion uses Money.to_paise() for Decimal precision —
     never float multiplication (Bug #6 / Idea #6 fix).
+
+    Compliance: @require_compliance("RBI") — hard gate requires RBI compliance
+    PASSED before any payment processing. Blocks if not PASSED.
     """
+    if tenant_id is None:
+        tenant_id = user.get("tenant_id", "default")
     body = await request.json()
     order_id = body.get("order_id")
     raw_amount = body.get("amount", 0)
     payment_method = body.get("payment_method", "UPI")
-    tenant_id = user.get("tenant_id", "default")
 
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id is required")
@@ -115,8 +138,12 @@ async def init_payment(
 
 
 @router.post("/confirm")
+@require_compliance("RBI")
 async def confirm_payment(
     request: Request,
+    vendor_id: str = None,
+    tenant_id: str = None,
+    session: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -126,7 +153,12 @@ async def confirm_payment(
     the payment into escrow via RazorpayGateway.
 
     Uses Money.to_paise() for capture amount — never float * 100.
+
+    Compliance: @require_compliance("RBI") — hard gate requires RBI compliance
+    PASSED before confirming payments. Blocks if not PASSED.
     """
+    if tenant_id is None:
+        tenant_id = user.get("tenant_id", "default")
     body = await request.json()
     razorpay_order_id = body.get("razorpay_order_id")
     razorpay_payment_id = body.get("razorpay_payment_id")

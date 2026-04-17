@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
 
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import compliance_check
 from shared.utils.database import get_session_factory
 from shared.utils.helpers import now_iso, generate_id
 from shared.types.schemas import EventType
@@ -119,6 +120,7 @@ async def get_kitchen(
 
 
 @router.put("/{kitchen_id}")
+@compliance_check("FSSAI")
 async def update_kitchen(
     kitchen_id: str,
     name: Optional[str] = None,
@@ -126,10 +128,18 @@ async def update_kitchen(
     staff_count: Optional[int] = None,
     is_active: Optional[bool] = None,
     size: Optional[str] = None,
+    vendor_id: str = None,
+    tenant_id: str = None,
     user: dict = Depends(require_role("vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
-    """Update kitchen details."""
+    """Update kitchen details.
+
+    Compliance: @compliance_check("FSSAI") — soft gate verifies vendor FSSAI
+    status before activating a kitchen. Logs warning if PENDING, blocks if FAILED.
+    """
+    if tenant_id is None:
+        tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
     result = await session.execute(
         select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
     )
