@@ -410,13 +410,13 @@ class TestOptimisticLocking:
     """Test shared optimistic locking module."""
 
     def test_module_imports(self):
-        from shared.optimistic_locking import OptimisticLockError
-        assert OptimisticLockError is not None
+        from shared.optimistic_locking import ConcurrentUpdateError
+        assert ConcurrentUpdateError is not None
 
     def test_version_mismatch_raises(self):
-        from shared.optimistic_locking import OptimisticLockError
-        with pytest.raises(OptimisticLockError):
-            raise OptimisticLockError("Version mismatch: expected 1, got 2")
+        from shared.optimistic_locking import ConcurrentUpdateError
+        with pytest.raises(ConcurrentUpdateError):
+            raise ConcurrentUpdateError("OrderModel", "order_123", 3)
 
 
 # ═══════════════════════════════════════════════════════════════
