@@ -10,7 +10,7 @@ from sqlalchemy import select, update, func
 
 from shared.auth.jwt import get_current_user, require_role
 from shared.compliance_decorators import compliance_check
-from shared.utils.database import get_session_factory
+from shared.utils.database import get_session_factory, ConcurrentModificationError
 from shared.utils.helpers import now_iso, generate_id
 from shared.types.schemas import EventType
 
@@ -116,6 +116,7 @@ async def get_kitchen(
         "throughput_per_minute": kitchen.throughput_per_minute,
         "fssai_license": kitchen.fssai_license,
         "gstin": kitchen.gstin,
+        "version": kitchen.version,
     }
 
 
@@ -128,12 +129,16 @@ async def update_kitchen(
     staff_count: Optional[int] = None,
     is_active: Optional[bool] = None,
     size: Optional[str] = None,
+    expected_version: Optional[int] = None,
     vendor_id: str = None,
     tenant_id: str = None,
     user: dict = Depends(require_role("vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
     """Update kitchen details.
+
+    Optimistic locking: Pass expected_version from the last read to prevent
+    lost updates. If version doesn't match, returns 409 Conflict.
 
     Compliance: @compliance_check("FSSAI") — soft gate verifies vendor FSSAI
     status before activating a kitchen. Logs warning if PENDING, blocks if FAILED.
@@ -147,6 +152,15 @@ async def update_kitchen(
     if not kitchen:
         raise HTTPException(status_code=404, detail="Kitchen not found")
 
+    # Optimistic locking: check version if provided
+    if expected_version is not None and not kitchen.check_version(expected_version):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Concurrent modification: kitchen was updated by another request. "
+                   f"Expected version {expected_version}, current is {kitchen.version}. "
+                   f"Please refresh and retry.",
+        )
+
     if name is not None:
         kitchen.name = name
     if max_concurrent_orders is not None:
@@ -158,10 +172,11 @@ async def update_kitchen(
     if size is not None:
         kitchen.size = size
 
+    kitchen.increment_version()
     kitchen.updated_at = datetime.now(timezone.utc)
     await session.commit()
 
-    return {"kitchen_id": str(kitchen.id), "updated": True}
+    return {"kitchen_id": str(kitchen.id), "updated": True, "version": kitchen.version}
 
 
 @router.get("/{kitchen_id}/load")
@@ -333,10 +348,19 @@ async def ack_order(
     if not queue_entry:
         raise HTTPException(status_code=404, detail="Order not in kitchen queue")
 
+    # Optimistic locking: capture version before mutation
+    expected_version = queue_entry.version
+    if not queue_entry.check_version(expected_version):
+        raise HTTPException(
+            status_code=409,
+            detail="Concurrent modification: queue entry was updated by another request. Please retry.",
+        )
+
     queue_entry.status = "IN_PREP"
     queue_entry.started_at = datetime.now(timezone.utc)
     if staff_id:
         queue_entry.staff_id = uuid.UUID(staff_id)
+    queue_entry.increment_version()
     await session.commit()
 
     return {
@@ -345,4 +369,5 @@ async def ack_order(
         "ack": True,
         "status": "IN_PREP",
         "staff_id": staff_id,
+        "version": queue_entry.version,
     }
