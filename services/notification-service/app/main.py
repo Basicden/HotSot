@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     await redis_client.connect()
     setup_token_revocation(redis_client)
     session_factory = get_session_factory("notification")
-    set_dependencies(session_factory, redis_client)
+    set_dependencies(session_factory, redis_client, kafka_producer)
     await kafka_producer.start()
     health_checker.mark_ready(True)
     logger.info("notification_service_started")

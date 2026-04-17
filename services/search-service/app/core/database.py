@@ -21,7 +21,7 @@ Migration Note (GIN Index):
     to_tsvector() inline in queries (slower but functional).
 """
 from sqlalchemy import Column, String, Integer, Float, Boolean, Text, Index
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, TSVECTOR, Numeric
 from shared.utils.database import BaseModel
 
 
@@ -37,8 +37,8 @@ class SearchIndexModel(BaseModel):
     cuisine = Column(String(50), nullable=True)
     city = Column(String(100), nullable=True)
     is_available = Column(Boolean, default=True)
-    price_min = Column(Float, nullable=True)  # Minimum price in INR
-    price_max = Column(Float, nullable=True)  # Maximum price in INR
+    price_min = Column(Numeric(10, 2), nullable=True)  # Minimum price in INR
+    price_max = Column(Numeric(10, 2), nullable=True)  # Maximum price in INR
     dietary_preference = Column(String(20), nullable=True, index=True)  # VEG / NON_VEG / VEGAN / EGGETARIAN
     search_vector = Column(Text, nullable=True)  # Legacy — kept for backward compat
     search_tsvector = Column(TSVECTOR, nullable=True)  # GIN-indexed full-text vector (set by migration)

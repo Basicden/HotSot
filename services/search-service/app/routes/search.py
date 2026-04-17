@@ -10,6 +10,7 @@ Search Strategy:
 """
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,8 +62,8 @@ async def search(
     city: Optional[str] = Query(None, description="City filter"),
     vendor_id: Optional[str] = Query(None, description="Filter by vendor UUID"),
     category: Optional[str] = Query(None, description="Category filter (e.g. Biryani, Burger)"),
-    price_min: Optional[float] = Query(None, description="Minimum price in INR", ge=0),
-    price_max: Optional[float] = Query(None, description="Maximum price in INR", ge=0),
+    price_min: Optional[Decimal] = Query(None, description="Minimum price in INR", ge=0),
+    price_max: Optional[Decimal] = Query(None, description="Maximum price in INR", ge=0),
     dietary: Optional[str] = Query(None, description="Dietary preference: VEG, NON_VEG, VEGAN, EGGETARIAN"),
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
@@ -230,8 +231,8 @@ async def index_entity(
     city: str = None,
     vendor_id: str = None,
     category: str = None,
-    price_min: float = None,
-    price_max: float = None,
+    price_min: Optional[Decimal] = None,
+    price_max: Optional[Decimal] = None,
     dietary: str = None,
     user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),

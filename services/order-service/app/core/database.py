@@ -92,6 +92,13 @@ class OrderModel(BaseModel):
         comment="Idempotency key for safe retries",
     )
 
+    version = Column(
+        Integer,
+        default=1,
+        nullable=False,
+        comment="Optimistic locking version — incremented on every update",
+    )
+
     prep_started_at = Column(DateTime(timezone=True), nullable=True)
     ready_at = Column(DateTime(timezone=True), nullable=True)
     arrived_at = Column(DateTime(timezone=True), nullable=True)

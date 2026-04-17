@@ -6,6 +6,9 @@ Production-grade billing with:
     - GST computation per Indian tax rules
     - Payout processing with Razorpay integration
     - Invoice listing and vendor billing dashboard
+
+All monetary calculations use the shared Money class to ensure
+Decimal-based precision and INR rounding consistency.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,6 +25,13 @@ from sqlalchemy import select, func
 
 from shared.auth.jwt import get_current_user, require_role
 from shared.utils.helpers import generate_id, now_iso
+from shared.money import (
+    Money,
+    round_inr,
+    calculate_gst,
+    calculate_commission,
+    validate_invoice_amount,
+)
 from app.core.database import InvoiceModel, PayoutModel
 
 logger = logging.getLogger(__name__)
@@ -46,44 +56,11 @@ async def get_session():
         yield session
 
 
-# Platform commission rates
-DEFAULT_COMMISSION_RATE = Decimal("0.15")  # 15% commission
-GST_ON_COMMISSION_RATE = Decimal("0.18")  # 18% GST on commission
-
-# Minimum invoice amount (₹1.00)
-MIN_INVOICE_AMOUNT = Decimal("1.00")
+# Minimum invoice amount — prevents zero-amount invoices (Bug #20)
+MIN_INVOICE_AMOUNT = Money("1.00")
 
 # Payout methods
 VALID_PAYOUT_METHODS = {"BANK_TRANSFER", "UPI", "RAZORPAY_PAYOUT"}
-
-
-def round_inr(amount: Decimal) -> Decimal:
-    """Round to INR 2 decimal places."""
-    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-def validate_invoice_amounts(
-    total_revenue: Decimal,
-    commission_amount: Decimal,
-    gst_amount: Decimal,
-    payout_amount: Decimal,
-) -> None:
-    """
-    Validate that all invoice amounts are positive before saving.
-
-    Raises ValueError if any amount is zero or negative.
-    This prevents creation of zero-amount invoices (Bug #20).
-    """
-    if total_revenue < MIN_INVOICE_AMOUNT:
-        raise ValueError(
-            f"Total revenue ₹{total_revenue} is below minimum invoice amount ₹{MIN_INVOICE_AMOUNT}"
-        )
-    if commission_amount < Decimal("0"):
-        raise ValueError(f"Commission amount cannot be negative: ₹{commission_amount}")
-    if gst_amount < Decimal("0"):
-        raise ValueError(f"GST amount cannot be negative: ₹{gst_amount}")
-    if payout_amount < Decimal("0"):
-        raise ValueError(f"Payout amount cannot be negative: ₹{payout_amount}")
 
 
 @router.post("/invoice/generate")
@@ -93,6 +70,7 @@ async def generate_invoice(
     period_end: str,
     commission_rate: Optional[Decimal] = None,
     is_interstate: bool = False,
+    allow_zero_draft: bool = False,
     user: dict = Depends(require_role("admin", "vendor_admin")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -106,6 +84,9 @@ async def generate_invoice(
     - Net payout amount
 
     Invoice number format: INV-YYYYMMDD-XXXXX
+
+    When no order data is provided, returns a 400 error instead of
+    creating a zero-amount draft (Bug #20 fix).
     """
     tenant_id = user.get("tenant_id", "default")
 
@@ -128,41 +109,50 @@ async def generate_invoice(
     if start_dt >= end_dt:
         raise HTTPException(status_code=400, detail="period_start must be before period_end")
 
-    # Generate sequential invoice number
-    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-    invoice_number = f"INV-{today_str}-{uuid.uuid4().hex[:5].upper()}"
+    # In a full implementation, we would query the order service for
+    # completed orders in this period for this vendor.
+    # For now, without order data, we reject zero-amount invoices (Bug #20 fix).
+    total_orders = 0
+    total_revenue = Money("0.00")
 
     # Use provided commission rate or default
     if commission_rate is not None:
-        comm_rate = round_inr(commission_rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) / Decimal("100")
+        comm_rate = Decimal(str(commission_rate)) / Decimal("100")
     else:
-        comm_rate = DEFAULT_COMMISSION_RATE
+        comm_rate = Decimal("0.15")
 
-    # In a full implementation, we would query the order service for
-    # completed orders in this period for this vendor.
-    # For now, the invoice is created with calculation structure.
-    # The caller (admin) provides total_orders and total_revenue,
-    # or we default to 0 for manual entry.
+    # Calculate commission and GST using shared money utilities
+    commission_result = calculate_commission(total_revenue, comm_rate)
+    commission_amount = commission_result["commission"]
+    gst_on_commission = commission_result["gst_on_commission"]
+    payout_amount = commission_result["net_payout"]
 
-    # Calculate commission and GST
-    # (In production: aggregate from order-service via Kafka/API)
-    total_orders = 0
-    total_revenue = Decimal("0")
+    # GST split using shared calculate_gst
+    gst_split = calculate_gst(commission_amount, rate=Decimal("0.18"), is_interstate=is_interstate)
+    cgst = gst_split["cgst"]
+    sgst = gst_split["sgst"]
+    igst = gst_split["igst"]
 
-    commission_amount = round_inr(total_revenue * comm_rate)
-    gst_on_commission = round_inr(commission_amount * GST_ON_COMMISSION_RATE)
+    # Enforce minimum invoice amount — no zero-amount invoices allowed
+    if total_revenue < MIN_INVOICE_AMOUNT:
+        if allow_zero_draft:
+            # Even with allow_zero_draft, we only create a placeholder record
+            # that MUST be finalized with real order data later
+            pass
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot generate invoice without order data. "
+                    "Provide order data (total_orders, total_revenue) to create a valid invoice, "
+                    "or set allow_zero_draft=True for a placeholder DRAFT invoice that must be "
+                    "finalized with real order data before payout."
+                ),
+            )
 
-    # GST split: CGST+SGST for intra-state, IGST for inter-state
-    if is_interstate:
-        igst = gst_on_commission
-        cgst = Decimal("0.00")
-        sgst = Decimal("0.00")
-    else:
-        cgst = round_inr(gst_on_commission / 2)
-        sgst = round_inr(gst_on_commission - cgst)  # Avoid rounding drift
-        igst = Decimal("0.00")
-
-    payout_amount = round_inr(total_revenue - commission_amount - gst_on_commission)
+    # Generate sequential invoice number
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    invoice_number = f"INV-{today_str}-{uuid.uuid4().hex[:5].upper()}"
 
     invoice = InvoiceModel(
         tenant_id=tenant_id,
@@ -171,11 +161,11 @@ async def generate_invoice(
         period_start=period_start,
         period_end=period_end,
         total_orders=total_orders,
-        total_revenue=str(total_revenue),
+        total_revenue=total_revenue.to_db(),
         commission_rate=str(round_inr(comm_rate * 100)),
-        commission_amount=str(commission_amount),
-        gst_amount=str(gst_on_commission),
-        payout_amount=str(payout_amount),
+        commission_amount=commission_amount.to_db(),
+        gst_amount=gst_on_commission.to_db(),
+        payout_amount=payout_amount.to_db(),
         status="DRAFT",
     )
     session.add(invoice)
@@ -193,17 +183,17 @@ async def generate_invoice(
         "period_start": period_start,
         "period_end": period_end,
         "total_orders": total_orders,
-        "total_revenue": str(total_revenue),
+        "total_revenue": total_revenue.to_db(),
         "commission_rate_pct": str(round_inr(comm_rate * 100)),
-        "commission_amount": str(commission_amount),
-        "gst_on_commission": str(gst_on_commission),
-        "cgst": str(cgst),
-        "sgst": str(sgst),
-        "igst": str(igst),
+        "commission_amount": commission_amount.to_db(),
+        "gst_on_commission": gst_on_commission.to_db(),
+        "cgst": cgst.to_db(),
+        "sgst": sgst.to_db(),
+        "igst": igst.to_db(),
         "is_interstate": is_interstate,
-        "payout_amount": str(payout_amount),
+        "payout_amount": payout_amount.to_db(),
         "status": "DRAFT",
-        "note": "Invoice created in DRAFT. Populate total_orders and total_revenue, then finalize.",
+        "note": "Invoice created in DRAFT. Use /invoice/finalize with actual order data to complete. Zero-amount DRAFT invoices will be rejected unless allow_zero_draft=True.",
     }
 
 
@@ -219,7 +209,8 @@ async def finalize_invoice(
     """
     Finalize an invoice with actual order data.
 
-    Computes commission, GST, and net payout amount.
+    Computes commission, GST, and net payout amount using Money class
+    for all calculations.
     """
     tenant_id = user.get("tenant_id", "default")
 
@@ -237,37 +228,36 @@ async def finalize_invoice(
     if invoice.status != "DRAFT":
         raise HTTPException(status_code=400, detail=f"Cannot finalize invoice in {invoice.status} status")
 
-    # Calculate amounts
-    revenue = round_inr(total_revenue.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-    comm_rate = Decimal(str(invoice.commission_rate)) / 100 if invoice.commission_rate else DEFAULT_COMMISSION_RATE
+    # Convert to Money object for all calculations
+    revenue = Money(total_revenue)
 
-    commission = round_inr(revenue * comm_rate)
-    gst = round_inr(commission * GST_ON_COMMISSION_RATE)
+    # Get commission rate from invoice record
+    comm_rate = Decimal(str(invoice.commission_rate)) / 100 if invoice.commission_rate else Decimal("0.15")
 
-    # GST split: CGST+SGST for intra-state, IGST for inter-state
-    if is_interstate:
-        igst = gst
-        cgst = Decimal("0.00")
-        sgst = Decimal("0.00")
-    else:
-        cgst = round_inr(gst / 2)
-        sgst = round_inr(gst - cgst)  # Avoid rounding drift
-        igst = Decimal("0.00")
+    # Calculate commission and GST using shared money utilities
+    commission_result = calculate_commission(revenue, comm_rate)
+    commission = commission_result["commission"]
+    gst = commission_result["gst_on_commission"]
+    payout = commission_result["net_payout"]
 
-    payout = round_inr(revenue - commission - gst)
+    # GST split using shared calculate_gst
+    gst_split = calculate_gst(commission, rate=Decimal("0.18"), is_interstate=is_interstate)
+    cgst = gst_split["cgst"]
+    sgst = gst_split["sgst"]
+    igst = gst_split["igst"]
 
-    # Validate all amounts are positive (Bug #20 fix)
+    # Validate all amounts — prevent zero-amount invoices (Bug #20 fix)
     try:
-        validate_invoice_amounts(revenue, commission, gst, payout)
+        validate_invoice_amount(revenue, min_amount=MIN_INVOICE_AMOUNT)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Update invoice
+    # Update invoice using Money.to_db() for storage
     invoice.total_orders = total_orders
-    invoice.total_revenue = str(revenue)
-    invoice.commission_amount = str(commission)
-    invoice.gst_amount = str(gst)
-    invoice.payout_amount = str(payout)
+    invoice.total_revenue = revenue.to_db()
+    invoice.commission_amount = commission.to_db()
+    invoice.gst_amount = gst.to_db()
+    invoice.payout_amount = payout.to_db()
     invoice.status = "FINALIZED"
 
     await session.commit()
@@ -277,14 +267,14 @@ async def finalize_invoice(
         "invoice_number": invoice.invoice_number,
         "status": "FINALIZED",
         "total_orders": total_orders,
-        "total_revenue": str(revenue),
-        "commission_amount": str(commission),
-        "gst_on_commission": str(gst),
-        "cgst": str(cgst),
-        "sgst": str(sgst),
-        "igst": str(igst),
+        "total_revenue": revenue.to_db(),
+        "commission_amount": commission.to_db(),
+        "gst_on_commission": gst.to_db(),
+        "cgst": cgst.to_db(),
+        "sgst": sgst.to_db(),
+        "igst": igst.to_db(),
         "is_interstate": is_interstate,
-        "payout_amount": str(payout),
+        "payout_amount": payout.to_db(),
     }
 
 
@@ -340,11 +330,15 @@ async def process_payout(
     Process a payout to a vendor.
 
     Creates a payout record and (optionally) triggers Razorpay payout.
-    Payout states: PENDING → PROCESSING → COMPLETED / FAILED
+    Payout states: PENDING -> PROCESSING -> COMPLETED / FAILED
+    Uses Money.to_paise() for Razorpay amount conversion.
     """
     tenant_id = user.get("tenant_id", "default")
 
-    if amount <= Decimal("0"):
+    # Convert to Money for validation and precision
+    payout_money = Money(amount)
+
+    if not payout_money.is_positive:
         raise HTTPException(status_code=400, detail="Payout amount must be positive")
 
     if method not in VALID_PAYOUT_METHODS:
@@ -368,13 +362,11 @@ async def process_payout(
                 detail="Payout already exists for this invoice",
             )
 
-    payout_amt = round_inr(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
     payout = PayoutModel(
         tenant_id=tenant_id,
         vendor_id=vendor_id,
         invoice_id=invoice_id,
-        amount=str(payout_amt),
+        amount=payout_money.to_db(),
         method=method,
         status="PENDING",
     )
@@ -397,7 +389,7 @@ async def process_payout(
                     json={
                         "account_number": "hotsot_escrow_account",
                         "fund_account_id": vendor_id,  # Should be Razorpay fund account ID
-                        "amount": int(payout_amt * 100),  # paise
+                        "amount": payout_money.to_paise(),  # paise — uses Money.to_paise() for precise conversion
                         "currency": "INR",
                         "mode": "IMPS",
                         "purpose": "payout",
@@ -428,7 +420,7 @@ async def process_payout(
     return {
         "payout_id": str(payout.id),
         "vendor_id": vendor_id,
-        "amount": str(payout_amt),
+        "amount": payout_money.to_db(),
         "method": method,
         "status": payout.status,
         "razorpay_payout_id": razorpay_payout_id,

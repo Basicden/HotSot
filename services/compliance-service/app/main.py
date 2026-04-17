@@ -16,6 +16,9 @@ from shared.utils.middleware import setup_middleware
 from app.core.database import ALL_MODELS
 from app.routes.compliance import router as compliance_router, set_dependencies
 
+# Import compliance registry to auto-register check functions on service startup
+import shared.compliance_registry  # noqa: F401
+
 SERVICE_NAME = "compliance"
 logger = logging.getLogger(__name__)
 

@@ -1,8 +1,10 @@
 """HotSot Compensation Service — Database Models."""
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, Text, Index
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, Index
+from sqlalchemy.dialects.postgresql import Numeric
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
+from decimal import Decimal
 from shared.utils.database import Base as SharedBase, BaseModelMixin
 
 class Base(SharedBase):
@@ -16,7 +18,7 @@ class CompensationCaseModel(Base, BaseModelMixin):
     user_id = Column(PG_UUID(as_uuid=True), nullable=False, index=True)
     kitchen_id = Column(PG_UUID(as_uuid=True), nullable=False, index=True)
     reason = Column(String(50), nullable=False)  # SHELF_EXPIRED/KITCHEN_FAILURE/PAYMENT_CONFLICT/DELAY
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String(3), default="INR")
     status = Column(String(20), default="PENDING")  # PENDING/APPROVED/PROCESSING/COMPLETED/FAILED
     auto_triggered = Column(Boolean, default=True)
@@ -38,7 +40,7 @@ class CompensationRuleModel(Base, BaseModelMixin):
     tenant_id = Column(PG_UUID(as_uuid=True), nullable=False, index=True)
     reason = Column(String(50), nullable=False)
     compensation_type = Column(String(20), default="FULL_REFUND")  # FULL_REFUND/PARTIAL_REFUND/CREDIT
-    percentage = Column(Float, default=100.0)
-    max_amount = Column(Float, default=5000.0)
+    percentage = Column(Numeric(6, 2), default=Decimal("100.00"))
+    max_amount = Column(Numeric(12, 2), default=Decimal("5000.00"))
     auto_approve = Column(Boolean, default=True)
     is_active = Column(Boolean, default=True)

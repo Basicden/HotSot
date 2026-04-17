@@ -1,4 +1,10 @@
-"""HotSot Vendor Service — Routes."""
+"""HotSot Vendor Service — Routes.
+
+Production-grade vendor management with compliance enforcement:
+    - @require_compliance("FSSAI", "GST") on activate endpoint
+    - @compliance_check("FSSAI") on menu creation (soft gate)
+    - Money class for all monetary fields
+"""
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -7,6 +13,8 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import compliance_check, require_compliance
+from shared.money import Money
 from app.core.database import VendorModel, VendorDocumentModel
 
 router = APIRouter()
@@ -46,6 +54,28 @@ async def get_vendor(vendor_id: str, user: dict = Depends(get_current_user), ses
         raise HTTPException(status_code=404, detail="Vendor not found")
     return {"vendor_id": str(vendor.id), "name": vendor.name, "email": vendor.email, "is_active": vendor.is_active, "tier": vendor.tier}
 
+@router.put("/{vendor_id}/activate")
+@require_compliance("FSSAI", "GST")
+async def activate_vendor(vendor_id: str, is_active: bool = True,
+                        tenant_id: str = None, session: AsyncSession = None,
+                        user: dict = Depends(require_role("admin"))):
+    """Activate a vendor — requires FSSAI and GST compliance PASSED.
+
+    This enforces the Compliance-as-Architecture principle:
+    a vendor cannot be activated without valid FSSAI and GST.
+    """
+    if session is None:
+        async with _session_factory() as session:
+            result = await session.execute(select(VendorModel).where(VendorModel.id == uuid.UUID(vendor_id)))
+            vendor = result.scalar_one_or_none()
+            if not vendor:
+                raise HTTPException(status_code=404, detail="Vendor not found")
+            vendor.is_active = is_active
+            vendor.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+    return {"vendor_id": vendor_id, "is_active": is_active, "compliance_enforced": True}
+
+
 @router.put("/{vendor_id}")
 async def update_vendor(vendor_id: str, name: str = None, is_active: bool = None,
                         commission_rate: Decimal = None, tier: str = None,
@@ -57,7 +87,9 @@ async def update_vendor(vendor_id: str, name: str = None, is_active: bool = None
         raise HTTPException(status_code=404, detail="Vendor not found")
     if name: vendor.name = name
     if is_active is not None: vendor.is_active = is_active
-    if commission_rate: vendor.commission_rate = commission_rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if commission_rate:
+        # Use Money class for precise commission rate storage
+        vendor.commission_rate = Money(str(commission_rate)).to_db()
     if tier: vendor.tier = tier
     vendor.updated_at = datetime.now(timezone.utc)
     await session.commit()

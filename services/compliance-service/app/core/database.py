@@ -1,6 +1,7 @@
 """HotSot Compliance Service — Database Models."""
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, Text, Index
 from sqlalchemy.dialects.postgresql import Numeric, UUID as PG_UUID, JSONB
 from shared.utils.database import BaseModel
@@ -69,8 +70,8 @@ class GSTRecordModel(BaseModel):
     taxable_amount = Column(Numeric(10, 2), nullable=False)
     cgst = Column(Numeric(10, 2), default=0.0)
     sgst = Column(Numeric(10, 2), default=0.0)
-    igst = Column(Float, default=0.0)
-    total_gst = Column(Float, nullable=False)
+    igst = Column(Numeric(10, 2), default=Decimal("0.00"))
+    total_gst = Column(Numeric(10, 2), nullable=False)
     gstin = Column(String(20), nullable=True)
     hsn_code = Column(String(10), default="9963")  # Food services
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

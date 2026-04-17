@@ -1,4 +1,9 @@
-"""HotSot Menu Service — Routes."""
+"""HotSot Menu Service — Routes.
+
+Production-grade menu management with compliance enforcement:
+    - @compliance_check("FSSAI") on menu item creation
+    - Money class for price handling
+"""
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -7,6 +12,8 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from shared.auth.jwt import get_current_user, require_role
+from shared.compliance_decorators import compliance_check
+from shared.money import Money
 from app.core.database import MenuItemModel, MenuCategoryModel
 
 router = APIRouter()
@@ -27,18 +34,30 @@ async def get_session():
         yield session
 
 @router.post("/item")
+@compliance_check("FSSAI")
 async def create_menu_item(name: str, vendor_id: str, price: Decimal, is_veg: bool = True,
                            category: str = None, batch_category: str = None, prep_time_seconds: int = 300,
-                           user: dict = Depends(require_role("vendor_admin")),
-                           session: AsyncSession = Depends(get_session)):
-    tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                           tenant_id: str = None, session: AsyncSession = None,
+                           user: dict = Depends(require_role("vendor_admin"))):
+    """Create a menu item — requires FSSAI compliance (soft gate).
+
+    Price is stored using Money class for Decimal precision.
+    """
+    if tenant_id is None:
+        tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+    # Use Money class for precise price handling
+    price_money = Money(str(price))
     item = MenuItemModel(tenant_id=tenant_id, vendor_id=uuid.UUID(vendor_id),
-                         name=name, price=price, is_veg=is_veg, category=category,
+                         name=name, price=price_money.to_db(), is_veg=is_veg, category=category,
                          batch_category=batch_category, prep_time_seconds=prep_time_seconds)
-    session.add(item)
-    await session.commit()
-    return {"item_id": str(item.id), "name": name, "price": str(price)}
+    if session is None:
+        async with _session_factory() as db_session:
+            db_session.add(item)
+            await db_session.commit()
+    else:
+        session.add(item)
+        await session.commit()
+    return {"item_id": str(item.id), "name": name, "price": price_money.to_db()}
 
 @router.get("/vendor/{vendor_id}")
 async def get_vendor_menu(vendor_id: str, user: dict = Depends(get_current_user),

@@ -22,6 +22,7 @@ class InvoiceModel(BaseModel):
     gst_amount = Column(Numeric(10, 2), default=0.0)
     payout_amount = Column(Numeric(12, 2), default=0.0)
     status = Column(String(20), default="DRAFT")  # DRAFT/SENT/PAID/OVERDUE
+    version = Column(Integer, default=1, nullable=False, comment="Optimistic locking version")
     due_date = Column(DateTime(timezone=True), nullable=True)
     paid_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

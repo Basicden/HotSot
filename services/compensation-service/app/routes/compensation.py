@@ -1,11 +1,16 @@
-"""HotSot Compensation Service — Routes."""
+"""HotSot Compensation Service — Routes.
+
+Uses the shared Money class for all monetary calculations to ensure
+Decimal-based precision and INR rounding consistency.
+"""
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from shared.auth.jwt import get_current_user, require_role
+from shared.money import Money
 from app.core.database import CompensationCaseModel, CompensationRuleModel
 from app.core.engine import CompensationEngine
 
@@ -34,11 +39,22 @@ async def trigger_compensation(
     user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """Trigger compensation for an order issue."""
+    """Trigger compensation for an order issue.
+
+    Uses Money class for order_amount handling to ensure
+    Decimal-based precision. Compensation amounts are stored
+    via Money.to_db() for database serialization.
+    """
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    order_amount = order_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # Convert order_amount to Money for precise handling
+    order_money = Money(order_amount)
+
     engine = CompensationEngine(_redis_client, _kafka_producer)
-    comp = engine.calculate_compensation(reason, str(order_amount), tenant_id)
+    comp = engine.calculate_compensation(reason, order_money.amount, tenant_id)
+
+    # Parse compensation amount as Money and use to_db() for storage
+    comp_money = Money(comp["compensation_amount"])
 
     case = CompensationCaseModel(
         tenant_id=uuid.UUID(tenant_id),
@@ -46,7 +62,7 @@ async def trigger_compensation(
         user_id=uuid.UUID(user_id),
         kitchen_id=uuid.UUID(kitchen_id),
         reason=reason,
-        amount=comp["compensation_amount"],
+        amount=comp_money.to_db(),
         currency=comp["currency"],
         status="APPROVED" if comp["auto_approve"] else "PENDING",
         auto_triggered=auto_triggered,
@@ -66,7 +82,7 @@ async def trigger_compensation(
 
     return {
         "case_id": str(case.id),
-        "compensation_amount": comp["compensation_amount"],
+        "compensation_amount": comp_money.to_db(),
         "status": case.status,
         "auto_approved": comp["auto_approve"],
     }

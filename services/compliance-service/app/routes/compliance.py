@@ -291,11 +291,16 @@ async def check_compliance_status(
         gst_status = "PENDING"
         gst_reason = "GST marked verified but no GST number on file"
 
-    # DPDP status
+    # DPDP status — verify actual compliance data, not just the flag
     dpdp_status = "PENDING"
     dpdp_reason = None
     if vendor_record.dpdp_verified:
-        dpdp_status = "PASSED"
+        # Even if dpdp_verified flag is True, verify underlying data
+        if vendor_record.dpdp_consent_obtained and vendor_record.dpdp_policy_published:
+            dpdp_status = "PASSED"
+        else:
+            dpdp_status = "FAILED"
+            dpdp_reason = "DPDP flag set but underlying data incomplete — data inconsistency detected"
     elif vendor_record.dpdp_consent_obtained and not vendor_record.dpdp_policy_published:
         dpdp_status = "FAILED"
         dpdp_reason = "DPDP consent obtained but privacy policy not published"
@@ -303,11 +308,18 @@ async def check_compliance_status(
         dpdp_status = "FAILED"
         dpdp_reason = "DPDP privacy policy published but consent not obtained"
 
-    # RBI status
+    # RBI status — verify actual compliance data, not just the flag
     rbi_status = "PENDING"
     rbi_reason = None
     if vendor_record.rbi_verified:
-        rbi_status = "PASSED"
+        # Even if rbi_verified flag is True, verify underlying data
+        if (vendor_record.rbi_payment_aggregator and
+            vendor_record.rbi_escrow_maintained and
+            vendor_record.rbi_refund_compliance):
+            rbi_status = "PASSED"
+        else:
+            rbi_status = "FAILED"
+            rbi_reason = "RBI flag set but underlying data incomplete — data inconsistency detected"
     elif vendor_record.rbi_payment_aggregator and not vendor_record.rbi_escrow_maintained:
         rbi_status = "FAILED"
         rbi_reason = "Payment aggregator registered but escrow not maintained"

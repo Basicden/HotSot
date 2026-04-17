@@ -35,6 +35,7 @@ class KitchenModel(Base, BaseModelMixin):
     throughput_per_minute = Column(Integer, default=15)
     fssai_license = Column(String(50), nullable=True)
     gstin = Column(String(20), nullable=True)
+    version = Column(Integer, default=1, nullable=False, comment="Optimistic locking version")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
@@ -59,6 +60,7 @@ class KitchenQueueModel(Base, BaseModelMixin):
     batch_category = Column(String(20), nullable=True)
     batch_id = Column(PG_UUID(as_uuid=True), nullable=True)
     status = Column(String(20), default="QUEUED")  # QUEUED/IN_PREP/COMPLETED/CANCELLED
+    version = Column(Integer, default=1, nullable=False, comment="Optimistic locking version")
     arrival_boost = Column(Float, default=0.0)
     staff_id = Column(PG_UUID(as_uuid=True), nullable=True)
     enqueued_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

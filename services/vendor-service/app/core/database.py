@@ -25,6 +25,7 @@ class VendorModel(BaseModel):
     onboarding_status = Column(String(20), default="PENDING")  # PENDING/DOCUMENTS_SUBMITTED/VERIFIED/REJECTED
     commission_rate = Column(Numeric(5, 2), default=15.0)  # percentage
     tier = Column(String(20), default="STANDARD")  # STANDARD/PREMIUM/ENTERPRISE
+    version = Column(Integer, default=1, nullable=False, comment="Optimistic locking version")
 
 
 class VendorDocumentModel(BaseModel):

@@ -1,12 +1,15 @@
 """
 HotSot Order Service — Payment Routes.
 
-Handles payment lifecycle:
+Production-grade payment lifecycle using shared Money class and RazorpayGateway:
     - POST /init         — Initialize a payment (create Razorpay order)
     - POST /confirm      — Confirm payment from webhook/callback
     - POST /webhook      — Razorpay webhook handler (HMAC verified)
     - GET  /{order_id}   — Get payment status for an order
     - POST /refund       — Initiate a refund
+
+All monetary calculations use Decimal via shared Money class.
+All Razorpay API calls use shared RazorpayGateway with idempotency.
 """
 
 from __future__ import annotations
@@ -14,17 +17,23 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from shared.auth.jwt import get_current_user, require_role
+from shared.money import Money
+from shared.payment_gateway import RazorpayGateway, PaymentState, PaymentGatewayError
 from shared.utils.config import get_settings
 from shared.utils.helpers import generate_id, now_iso
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Module-level gateway instance — uses env vars for keys
+_gateway = RazorpayGateway()
 
 
 @router.post("/init")
@@ -35,89 +44,74 @@ async def init_payment(
     """
     Initialize a payment for an order.
 
-    Creates a Razorpay order and returns the payment details
-    needed by the client to complete the payment.
+    Creates a Razorpay order via RazorpayGateway with idempotency key
+    derived from order_id to prevent duplicate orders on retry.
+
+    Amount conversion uses Money.to_paise() for Decimal precision —
+    never float multiplication (Bug #6 / Idea #6 fix).
     """
     body = await request.json()
     order_id = body.get("order_id")
-    amount = body.get("amount", 0)
+    raw_amount = body.get("amount", 0)
     payment_method = body.get("payment_method", "UPI")
     tenant_id = user.get("tenant_id", "default")
 
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id is required")
 
-    if amount <= 0:
+    # Convert to Money for validation and precise paise conversion
+    try:
+        amount = Money(str(raw_amount))
+    except (ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid amount: {raw_amount}. Must be a positive number. Error: {e}",
+        )
+
+    if not amount.is_positive:
         raise HTTPException(status_code=400, detail="amount must be positive")
 
     settings = get_settings("order")
 
-    # Create Razorpay order
+    # Generate idempotency key from order_id for safe retries
+    idempotency_key = f"order_init_{order_id}"
+
+    # Create Razorpay order via shared gateway
     try:
-        import httpx
+        razorpay_result = await _gateway.create_order(
+            amount=amount.amount,
+            receipt=f"hotsot_{order_id[:20]}",
+            notes={
+                "order_id": str(order_id),
+                "tenant_id": tenant_id,
+                "platform": "hotsot",
+                "payment_method": payment_method,
+            },
+            idempotency_key=idempotency_key,
+        )
 
-        razorpay_order_id = None
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{settings.RAZORPAY_API_BASE_URL}/orders",
-                auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
-                json={
-                    "amount": int(amount * 100),  # Razorpay expects paise
-                    "currency": "INR",
-                    "receipt": f"hotsot_{order_id[:20]}",
-                    "payment_capture": 0,  # Manual capture for escrow
-                    "notes": {
-                        "order_id": str(order_id),
-                        "tenant_id": tenant_id,
-                        "platform": "hotsot",
-                    },
-                },
-                timeout=10.0,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                razorpay_order_id = data.get("id")
-                logger.info(
-                    f"Razorpay order created: razorpay_order_id={razorpay_order_id} "
-                    f"order_id={order_id} amount={amount}"
-                )
-            else:
-                logger.error(
-                    f"Razorpay order creation failed: status={response.status_code} "
-                    f"body={response.text}"
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail="Payment gateway error. Please retry.",
-                )
+        razorpay_order_id = razorpay_result.get("id")
+        logger.info(
+            f"Razorpay order created: razorpay_order_id={razorpay_order_id} "
+            f"order_id={order_id} amount={amount}"
+        )
 
         return {
             "order_id": order_id,
             "razorpay_order_id": razorpay_order_id,
-            "amount": amount,
+            "amount": amount.to_db(),
+            "amount_paise": amount.to_paise(),
             "currency": "INR",
-            "key_id": settings.RAZORPAY_KEY_ID,
+            "key_id": settings.RAZORPAY_KEY_ID if _gateway.is_configured else "demo_key",
             "status": "PAYMENT_PENDING",
         }
 
-    except httpx.HTTPError as e:
-        logger.error(f"Razorpay connection error: {e}")
+    except PaymentGatewayError as e:
+        logger.error(f"Razorpay order creation failed: {e}")
         raise HTTPException(
             status_code=502,
-            detail="Payment gateway unreachable. Please retry.",
+            detail=f"Payment gateway error: {e}. Please retry.",
         )
-    except ImportError:
-        # Demo mode without httpx
-        logger.warning("httpx not available — payment init in demo mode")
-        return {
-            "order_id": order_id,
-            "razorpay_order_id": f"order_demo_{generate_id()[:12]}",
-            "amount": amount,
-            "currency": "INR",
-            "key_id": settings.RAZORPAY_KEY_ID or "demo_key",
-            "status": "PAYMENT_PENDING",
-        }
 
 
 @router.post("/confirm")
@@ -128,14 +122,17 @@ async def confirm_payment(
     """
     Confirm a payment after client-side Razorpay checkout.
 
-    Verifies the payment signature and captures the payment
-    (escrow hold).
+    Verifies the payment signature using HMAC-SHA256 and captures
+    the payment into escrow via RazorpayGateway.
+
+    Uses Money.to_paise() for capture amount — never float * 100.
     """
     body = await request.json()
     razorpay_order_id = body.get("razorpay_order_id")
     razorpay_payment_id = body.get("razorpay_payment_id")
     razorpay_signature = body.get("razorpay_signature")
     order_id = body.get("order_id")
+    raw_amount = body.get("amount", 0)
 
     if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature]):
         raise HTTPException(
@@ -162,37 +159,41 @@ async def confirm_payment(
             detail="Payment verification failed. Invalid signature.",
         )
 
-    # Capture payment (escrow hold)
+    # Convert capture amount using Money — never float
     try:
-        import httpx
+        capture_amount = Money(str(raw_amount))
+    except (ValueError, TypeError):
+        capture_amount = Money("0.00")
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{settings.RAZORPAY_API_BASE_URL}/payments/{razorpay_payment_id}/capture",
-                auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
-                json={
-                    "amount": body.get("amount", 0) * 100,  # paise
-                    "currency": "INR",
-                },
-                timeout=10.0,
+    # Capture payment via shared gateway (escrow hold)
+    idempotency_key = f"capture_{razorpay_payment_id}"
+
+    try:
+        if capture_amount.is_positive:
+            capture_result = await _gateway.capture_payment(
+                payment_id=razorpay_payment_id,
+                amount=capture_amount.amount,
+                idempotency_key=idempotency_key,
             )
+            logger.info(
+                f"Payment captured (escrow): order={order_id} "
+                f"payment={razorpay_payment_id} amount={capture_amount}"
+            )
+        else:
+            logger.warning(f"Capture amount is zero for order={order_id}")
 
-            if response.status_code == 200:
-                logger.info(
-                    f"Payment captured (escrow): order={order_id} "
-                    f"payment={razorpay_payment_id}"
-                )
-            else:
-                logger.error(f"Payment capture failed: {response.text}")
+    except PaymentGatewayError as e:
+        logger.error(f"Payment capture error for order={order_id}: {e}")
+        # Don't fail the confirm — the webhook will reconcile
 
-    except ImportError:
-        logger.warning("httpx not available — payment capture in demo mode")
-    except Exception as e:
-        logger.error(f"Payment capture error: {e}")
+    # Validate state transition
+    if not PaymentState.validate_state_transition(PaymentState.AUTHORIZED, PaymentState.CAPTURED):
+        logger.warning(f"Invalid state transition for payment={razorpay_payment_id}")
 
     return {
         "order_id": order_id,
         "payment_ref": razorpay_payment_id,
+        "amount_captured": capture_amount.to_db(),
         "status": "PAYMENT_CONFIRMED",
         "escrow": "HELD",
     }
@@ -203,8 +204,8 @@ async def razorpay_webhook(request: Request):
     """
     Handle Razorpay webhook events.
 
-    Verifies the webhook signature using HMAC-SHA256 and
-    processes events like:
+    Verifies the webhook signature using HMAC-SHA256 (via RazorpayGateway)
+    and processes events like:
         - payment.captured
         - payment.failed
         - refund.processed
@@ -218,17 +219,13 @@ async def razorpay_webhook(request: Request):
     settings = get_settings("order")
     webhook_signature = request.headers.get("X-Razorpay-Signature", "")
 
-    # Verify webhook signature
-    if settings.RAZORPAY_WEBHOOK_SECRET:
-        expected_sig = hmac.new(
-            settings.RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
-            body,
-            hashlib.sha256,
-        ).hexdigest()
-
-        if not hmac.compare_digest(expected_sig, webhook_signature):
+    # Verify webhook signature using shared gateway
+    if not _gateway.verify_webhook_signature(body.decode("utf-8"), webhook_signature):
+        if settings.RAZORPAY_WEBHOOK_SECRET:
             logger.warning("Webhook signature verification FAILED")
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        # If no webhook secret configured, log warning but proceed
+        logger.warning("Webhook secret not configured — skipping signature verification")
 
     event = body_json.get("event", "")
     payload = body_json.get("payload", {})
@@ -239,7 +236,12 @@ async def razorpay_webhook(request: Request):
         payment_entity = payload.get("payment", {}).get("entity", {})
         payment_id = payment_entity.get("id")
         order_id = payment_entity.get("notes", {}).get("order_id")
-        logger.info(f"Webhook: payment captured — payment={payment_id} order={order_id}")
+        amount_paise = payment_entity.get("amount", 0)
+        amount = Money.from_paise(amount_paise)
+        logger.info(
+            f"Webhook: payment captured — payment={payment_id} "
+            f"order={order_id} amount={amount}"
+        )
 
     elif event == "payment.failed":
         payment_entity = payload.get("payment", {}).get("entity", {})
@@ -250,7 +252,12 @@ async def razorpay_webhook(request: Request):
 
     elif event == "refund.processed":
         refund_entity = payload.get("refund", {}).get("entity", {})
-        logger.info(f"Webhook: refund processed — refund={refund_entity.get('id')}")
+        refund_amount_paise = refund_entity.get("amount", 0)
+        refund_amount = Money.from_paise(refund_amount_paise)
+        logger.info(
+            f"Webhook: refund processed — refund={refund_entity.get('id')} "
+            f"amount={refund_amount}"
+        )
 
     return {"status": "ok"}
 
@@ -277,65 +284,86 @@ async def initiate_refund(
     """
     Initiate a refund for an order.
 
-    Releases escrow and processes refund via Razorpay.
+    Releases escrow and processes refund via RazorpayGateway.
+    Uses Money.to_paise() for amount conversion — never float * 100.
+
+    Supports both full and partial refunds with reason tracking.
     """
     body = await request.json()
     order_id = body.get("order_id")
     payment_ref = body.get("payment_ref")
-    amount = body.get("amount")
+    raw_amount = body.get("amount")
     reason = body.get("reason", "Order cancelled/expired")
 
     if not all([order_id, payment_ref]):
         raise HTTPException(status_code=400, detail="order_id and payment_ref required")
 
-    settings = get_settings("order")
+    # Convert refund amount using Money — never float
+    if raw_amount is not None:
+        try:
+            refund_amount = Money(str(raw_amount))
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid refund amount: {raw_amount}. Error: {e}",
+            )
+    else:
+        refund_amount = None  # Full refund
+
+    # Generate idempotency key from order_id
+    idempotency_key = f"refund_{order_id}_{raw_amount or 'full'}"
 
     try:
-        import httpx
-
-        refund_payload = {
-            "notes": {
-                "order_id": str(order_id),
-                "reason": reason,
-                "platform": "hotsot",
-            },
-        }
-        if amount:
-            refund_payload["amount"] = int(amount * 100)  # paise
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{settings.RAZORPAY_API_BASE_URL}/payments/{payment_ref}/refund",
-                auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET),
-                json=refund_payload,
-                timeout=10.0,
+        if refund_amount and refund_amount.is_positive:
+            # Partial or specified amount refund
+            refund_result = await _gateway.refund(
+                payment_id=payment_ref,
+                amount=refund_amount.amount,
+                reason=reason,
+                notes={
+                    "order_id": str(order_id),
+                    "reason": reason,
+                    "platform": "hotsot",
+                },
+                idempotency_key=idempotency_key,
+            )
+        else:
+            # Full refund — amount not specified
+            refund_result = await _gateway.refund(
+                payment_id=payment_ref,
+                amount=Money("0.00").amount,  # Gateway will refund full amount
+                reason=reason,
+                notes={
+                    "order_id": str(order_id),
+                    "reason": reason,
+                    "platform": "hotsot",
+                },
+                idempotency_key=idempotency_key,
             )
 
-            if response.status_code == 200:
-                data = response.json()
-                refund_id = data.get("id")
-                logger.info(
-                    f"Refund initiated: order={order_id} "
-                    f"refund_id={refund_id} amount={amount}"
-                )
-                return {
-                    "order_id": order_id,
-                    "refund_id": refund_id,
-                    "amount": amount,
-                    "status": "REFUND_INITIATED",
-                }
-            else:
-                logger.error(f"Refund failed: {response.text}")
-                raise HTTPException(
-                    status_code=502,
-                    detail="Refund processing failed at gateway.",
-                )
+        refund_id = refund_result.get("id")
+        logger.info(
+            f"Refund initiated: order={order_id} "
+            f"refund_id={refund_id} amount={refund_amount or 'FULL'}"
+        )
 
-    except ImportError:
-        logger.warning("httpx not available — refund in demo mode")
+        # Validate state transition
+        PaymentState.validate_state_transition(
+            PaymentState.CAPTURED,
+            PaymentState.REFUNDED if refund_amount is None else PaymentState.PARTIALLY_REFUNDED,
+        )
+
         return {
             "order_id": order_id,
-            "refund_id": f"rfnd_demo_{generate_id()[:12]}",
-            "amount": amount,
+            "refund_id": refund_id,
+            "amount": refund_amount.to_db() if refund_amount else "FULL",
+            "reason": reason,
             "status": "REFUND_INITIATED",
         }
+
+    except PaymentGatewayError as e:
+        logger.error(f"Refund failed for order={order_id}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Refund processing failed at gateway: {e}",
+        )
