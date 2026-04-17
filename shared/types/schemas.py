@@ -10,6 +10,7 @@ All models include tenant_id for multi-tenancy support.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, ConfigDict
@@ -228,7 +229,7 @@ class OrderCreateRequest(BaseModel):
     kitchen_id: str
     tenant_id: str = Field(default="default")
     items: List[Dict[str, Any]] = Field(default_factory=list)
-    total_amount: Optional[float] = None
+    total_amount: Optional[Decimal] = None
     payment_method: str = "UPI"
     user_tier: UserTier = UserTier.FREE
     requested_time: Optional[str] = None
@@ -360,7 +361,7 @@ class CompensationEvent(BaseModel):
     order_id: str
     tenant_id: str = Field(default="default")
     reason: str  # SHELF_EXPIRED, KITCHEN_FAILURE, PAYMENT_CONFLICT
-    amount: float
+    amount: Decimal  # NEVER float for money — use Decimal
     currency: str = "INR"
     auto_triggered: bool = True
 
