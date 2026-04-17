@@ -49,8 +49,22 @@ from redis.asyncio import ConnectionPool
 from redis.exceptions import RedisError, ConnectionError as RedisConnectionError
 
 from shared.utils.config import get_settings
+from shared.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
 
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL CIRCUIT BREAKER FOR REDIS
+# ═══════════════════════════════════════════════════════════════
+# Single circuit breaker protects ALL Redis operations across ALL services.
+# When Redis is down, the circuit opens and all calls fail-fast without
+# attempting connections (prevents cascade failures and connection timeouts).
+_redis_circuit_breaker = CircuitBreaker(
+    service_name="redis",
+    failure_threshold=5,      # Open after 5 consecutive Redis failures
+    recovery_timeout=30,      # Try again after 30 seconds
+    success_threshold=2,      # Close after 2 consecutive successes
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -190,6 +204,9 @@ class RedisClient:
         """
         Acquire a distributed lock using SET NX EX.
 
+        Circuit breaker: If Redis circuit is OPEN, returns False immediately
+        without attempting connection. Prevents timeout cascade failures.
+
         FAIL-CLOSED: Returns False if Redis is down.
         This ensures that operations requiring locks are NOT executed
         when Redis is unavailable.
@@ -202,7 +219,16 @@ class RedisClient:
         Returns:
             True if lock acquired, False if already locked or Redis unavailable.
         """
+        # Circuit breaker: fail-fast if Redis is known to be down
+        if not await _redis_circuit_breaker.allow_request():
+            logger.warning(
+                f"Circuit breaker OPEN for Redis — lock acquisition DENIED for key={key} "
+                f"(fail-fast, fail-CLOSED)"
+            )
+            return False
+
         if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
             logger.error(f"Redis unavailable — lock acquisition DENIED for key={key} (fail-CLOSED)")
             return False
 
@@ -223,10 +249,12 @@ class RedisClient:
             else:
                 logger.debug(f"Lock NOT acquired (already held): key={lock_key}")
 
+            await _redis_circuit_breaker.record_success()
             return acquired
 
         except RedisError as e:
             # FAIL-CLOSED: return False when Redis errors
+            await _redis_circuit_breaker.record_failure(e)
             logger.error(
                 f"Redis error during lock acquisition for key={key}: {e} "
                 f"— returning False (fail-CLOSED)"
@@ -337,6 +365,9 @@ class RedisClient:
         """
         Set a cache value with TTL.
 
+        Circuit breaker: If Redis circuit is OPEN, fails fast without
+        attempting connection. Prevents timeout cascade failures.
+
         Args:
             key: Cache key.
             value: Value to cache (will be JSON-serialized).
@@ -344,9 +375,18 @@ class RedisClient:
             prefix: Key prefix (default: "cache").
 
         Returns:
-            True if set successfully, False on error.
+            True if set successfully, False on error or circuit open.
         """
+        # Circuit breaker: fail-fast if Redis is known to be down
+        if not await _redis_circuit_breaker.allow_request():
+            logger.warning(
+                f"Circuit breaker OPEN for Redis — cache set DENIED for key={prefix}:{key} "
+                f"(fail-fast, no connection attempted)"
+            )
+            return False
+
         if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
             logger.warning(f"Redis unavailable — cache set DENIED for key={prefix}:{key}")
             return False
 
@@ -355,10 +395,12 @@ class RedisClient:
         try:
             serialized = json.dumps(value, default=str)
             await self._client.set(cache_key, serialized, ex=ttl)
+            await _redis_circuit_breaker.record_success()
             logger.debug(f"Cache set: key={cache_key} ttl={ttl}")
             return True
 
         except (RedisError, TypeError) as e:
+            await _redis_circuit_breaker.record_failure(e)
             logger.error(f"Cache set failed for key={cache_key}: {e}")
             return False
 
@@ -370,6 +412,9 @@ class RedisClient:
         """
         Get a cached value.
 
+        Circuit breaker: If Redis circuit is OPEN, returns None immediately
+        without attempting connection. Prevents timeout cascade failures.
+
         FAIL-CLOSED: Returns None if Redis is down (do NOT assume cache is valid).
 
         Args:
@@ -377,9 +422,18 @@ class RedisClient:
             prefix: Key prefix.
 
         Returns:
-            Deserialized value or None if not found / error.
+            Deserialized value or None if not found / error / circuit open.
         """
+        # Circuit breaker: fail-fast if Redis is known to be down
+        if not await _redis_circuit_breaker.allow_request():
+            logger.warning(
+                f"Circuit breaker OPEN for Redis — cache get DENIED for key={prefix}:{key} "
+                f"(fail-fast, returning None)"
+            )
+            return None
+
         if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
             logger.warning(f"Redis unavailable — cache get DENIED for key={prefix}:{key}")
             return None
 
@@ -387,36 +441,30 @@ class RedisClient:
 
         try:
             data = await self._client.get(cache_key)
+            await _redis_circuit_breaker.record_success()
             if data is None:
                 return None
             return json.loads(data)
 
         except (RedisError, json.JSONDecodeError) as e:
+            await _redis_circuit_breaker.record_failure(e)
             logger.error(f"Cache get failed for key={cache_key}: {e}")
             return None
 
     async def cache_delete(self, key: str, prefix: str = "cache") -> bool:
-        """
-        Delete a cached value.
-
-        Args:
-            key: Cache key.
-            prefix: Key prefix.
-
-        Returns:
-            True if deleted, False on error.
-        """
-        if not self._is_connected():
-            logger.warning(f"Redis unavailable — cache delete DENIED for key={prefix}:{key}")
+        """Delete a cached value. Circuit-breaker protected."""
+        if not await _redis_circuit_breaker.allow_request():
             return False
-
+        if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
+            return False
         cache_key = f"{prefix}:{key}"
-
         try:
             await self._client.delete(cache_key)
+            await _redis_circuit_breaker.record_success()
             return True
-
         except RedisError as e:
+            await _redis_circuit_breaker.record_failure(e)
             logger.error(f"Cache delete failed for key={cache_key}: {e}")
             return False
 
@@ -551,27 +599,20 @@ class RedisClient:
     # ═══════════════════════════════════════════════════════════
 
     async def publish(self, channel: str, message: dict) -> bool:
-        """
-        Publish a message to a Redis channel.
-
-        Args:
-            channel: Channel name.
-            message: Message payload (will be JSON-serialized).
-
-        Returns:
-            True if published, False on error.
-        """
-        if not self._is_connected():
-            logger.warning(f"Redis unavailable — publish DENIED for channel={channel}")
+        """Publish a message to a Redis channel. Circuit-breaker protected."""
+        if not await _redis_circuit_breaker.allow_request():
+            logger.warning(f"Circuit breaker OPEN — publish DENIED for channel={channel}")
             return False
-
+        if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
+            return False
         try:
             serialized = json.dumps(message, default=str)
             await self._client.publish(channel, serialized)
-            logger.debug(f"Published to channel={channel}")
+            await _redis_circuit_breaker.record_success()
             return True
-
         except RedisError as e:
+            await _redis_circuit_breaker.record_failure(e)
             logger.error(f"Publish failed for channel={channel}: {e}")
             return False
 
@@ -629,60 +670,31 @@ class RedisClient:
         limit: int = 60,
         window_seconds: int = 60,
     ) -> tuple[bool, int]:
-        """
-        Check rate limit using sliding window counter.
-
-        FAIL-CLOSED: Returns (False, 0) if Redis is down —
-        rate limit is NOT bypassed when Redis is unavailable.
-
-        Args:
-            identifier: Unique identifier (e.g., tenant_id, user_id, IP).
-            limit: Maximum requests allowed in the window.
-            window_seconds: Time window in seconds.
-
-        Returns:
-            Tuple of (is_allowed, remaining_count).
-        """
-        if not self._is_connected():
-            # FAIL-CLOSED: deny requests when Redis is down
-            logger.warning(
-                f"Redis unavailable — rate limit DENIED for {identifier} (fail-CLOSED)"
-            )
+        """Check rate limit. Circuit-breaker protected. FAIL-CLOSED."""
+        if not await _redis_circuit_breaker.allow_request():
+            logger.warning(f"Circuit breaker OPEN — rate limit DENIED for {identifier} (fail-CLOSED)")
             return False, 0
-
+        if not self._is_connected():
+            await _redis_circuit_breaker.record_failure(RuntimeError("Redis not connected"))
+            return False, 0
         key = f"ratelimit:{identifier}"
-
         try:
             pipe = self._client.pipeline()
             now_ts = await self._client.time()
             now = int(now_ts[0])
             window_start = now - window_seconds
-
-            # Remove old entries and add current request
             pipe.zremrangebyscore(key, 0, window_start)
             pipe.zcard(key)
             pipe.zadd(key, {str(now): now})
             pipe.expire(key, window_seconds)
-
             results = await pipe.execute()
             current_count = results[1]
-
             is_allowed = current_count < limit
             remaining = max(0, limit - current_count - 1)
-
-            if not is_allowed:
-                logger.debug(
-                    f"Rate limit exceeded: identifier={identifier} "
-                    f"count={current_count} limit={limit}"
-                )
-
+            await _redis_circuit_breaker.record_success()
             return is_allowed, remaining
-
         except RedisError as e:
-            logger.error(
-                f"Redis error during rate limit check for {identifier}: {e} "
-                f"— denying (fail-CLOSED)"
-            )
+            await _redis_circuit_breaker.record_failure(e)
             return False, 0
 
     # ═══════════════════════════════════════════════════════════
@@ -690,27 +702,21 @@ class RedisClient:
     # ═══════════════════════════════════════════════════════════
 
     async def health_check(self) -> dict[str, Any]:
-        """
-        Check Redis connectivity and return health info.
-
-        Returns:
-            Dict with health status, latency, and connection info.
-        """
+        """Check Redis connectivity. Includes circuit breaker state."""
+        cb_metrics = _redis_circuit_breaker.metrics
         if not self._is_connected():
             return {
                 "status": "unhealthy",
                 "error": "Redis not connected",
                 "service": self._service_name,
+                "circuit_breaker": cb_metrics,
             }
-
         try:
             import time
             start = time.monotonic()
             await self._client.ping()
             latency_ms = (time.monotonic() - start) * 1000
-
             info = await self._client.info("server")
-
             return {
                 "status": "healthy",
                 "latency_ms": round(latency_ms, 2),
@@ -718,13 +724,15 @@ class RedisClient:
                 "connected_clients": info.get("connected_clients", 0),
                 "used_memory_human": info.get("used_memory_human", "unknown"),
                 "service": self._service_name,
+                "circuit_breaker": cb_metrics,
             }
-
         except RedisError as e:
+            await _redis_circuit_breaker.record_failure(e)
             return {
                 "status": "unhealthy",
                 "error": str(e),
                 "service": self._service_name,
+                "circuit_breaker": cb_metrics,
             }
 
 
