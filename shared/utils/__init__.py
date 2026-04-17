@@ -43,6 +43,7 @@ from shared.utils.redis_client import (
 from shared.utils.kafka_client import (
     KafkaProducer,
     KafkaConsumer,
+    KafkaConsumerManager,
     EventPublisher,
     event_publisher,
     serialize_event,
@@ -126,6 +127,7 @@ __all__ = [
     # Kafka
     "KafkaProducer",
     "KafkaConsumer",
+    "KafkaConsumerManager",
     "EventPublisher",
     "event_publisher",
     "serialize_event",
