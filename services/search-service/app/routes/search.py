@@ -1,12 +1,13 @@
 """HotSot Search Service — Routes.
 
-V2: PostgreSQL full-text search with GIN/tsvector, pagination,
-    relevance ranking, and multi-faceted filtering.
+V3: Dual-engine search with Elasticsearch + PostgreSQL fallback.
+    - Primary: Elasticsearch (fuzzy matching, autocomplete, better relevance)
+    - Fallback: PostgreSQL tsvector + ilike (when ES is unavailable)
 
 Search Strategy:
-    1. Primary: tsvector @@ tsquery (fast, GIN-indexed, linguistically aware)
-    2. Fallback: ilike partial match (catches substrings tsvector misses)
-    3. Results are ranked by ts_rank (relevance) then popularity_score
+    1. Try Elasticsearch first (if available and circuit breaker allows)
+    2. Fallback to PostgreSQL tsvector + ilike if ES is down
+    3. Results include 'engine' field to indicate which engine was used
 """
 import uuid
 from datetime import datetime, timezone
@@ -22,12 +23,14 @@ router = APIRouter()
 _session_factory = None
 _redis_client = None
 _kafka_producer = None
+_es_engine = None
 
-def set_dependencies(session_factory, redis_client=None, kafka_producer=None):
-    global _session_factory, _redis_client, _kafka_producer
+def set_dependencies(session_factory, redis_client=None, kafka_producer=None, es_engine=None):
+    global _session_factory, _redis_client, _kafka_producer, _es_engine
     _session_factory = session_factory
     _redis_client = redis_client
     _kafka_producer = kafka_producer
+    _es_engine = es_engine
 
 async def get_session():
     if _session_factory is None:
@@ -72,13 +75,49 @@ async def search(
 ):
     """Full-text search across vendors, menu items, kitchens.
 
-    Uses PostgreSQL GIN/tsvector for fast linguistic search with ilike
-    fallback for partial substring matches. Results are ranked by
-    tsvector relevance score and popularity.
+    Dual-engine: Tries Elasticsearch first (fuzzy, better relevance),
+    falls back to PostgreSQL tsvector + ilike if ES is unavailable.
 
     Pagination: Use limit/offset. Response includes total count.
     """
     tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
+
+    # ── Try Elasticsearch first ──────────────────────────────
+    if _es_engine and _es_engine.is_available:
+        es_filters = {
+            "entity_type": entity_type,
+            "cuisine": cuisine,
+            "city": city,
+            "vendor_id": vendor_id,
+            "category": category,
+            "dietary": dietary.upper() if dietary else None,
+            "price_min": float(price_min) if price_min else None,
+            "price_max": float(price_max) if price_max else None,
+        }
+        # Remove None values
+        es_filters = {k: v for k, v in es_filters.items() if v is not None}
+
+        es_result = await _es_engine.search(
+            query=q or "",
+            filters=es_filters,
+            limit=limit,
+            offset=offset,
+            tenant_id=tenant_id,
+        )
+
+        if es_result.get("results") or es_result.get("engine") == "elasticsearch":
+            # ES responded — use its results
+            return {
+                "query": q,
+                "total": es_result.get("total", 0),
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + limit) < es_result.get("total", 0),
+                "results": es_result.get("results", []),
+                "engine": "elasticsearch",
+            }
+
+    # ── Fallback: PostgreSQL tsvector + ilike ────────────────
 
     # ─── Build base conditions ────────────────────────────────
     conditions = [
@@ -194,6 +233,7 @@ async def search(
         "offset": offset,
         "has_more": (offset + limit) < total,
         "results": items,
+        "engine": "postgresql_tsvector",
     }
 
 
@@ -279,7 +319,29 @@ async def index_entity(
     )
     session.add(idx)
     await session.commit()
-    return {"indexed": True, "entity_id": entity_id}
+
+    # Also index in Elasticsearch (if available)
+    if _es_engine and _es_engine.is_available:
+        doc = {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "vendor_id": vendor_id,
+            "name": name,
+            "description": description,
+            "cuisine": cuisine,
+            "tags": tags or [],
+            "city": city,
+            "category": category,
+            "price_min": float(price_min) if price_min else None,
+            "price_max": float(price_max) if price_max else None,
+            "dietary_preference": dietary,
+            "tenant_id": tenant_id,
+            "is_available": True,
+            "popularity_score": 0.0,
+        }
+        await _es_engine.index_document(doc)
+
+    return {"indexed": True, "entity_id": entity_id, "engine": "elasticsearch+postgresql"}
 
 
 @router.get("/suggest")

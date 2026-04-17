@@ -1,4 +1,4 @@
-"""HotSot Search Service — V2 Production-Grade."""
+"""HotSot Search Service — V2 Production-Grade with Elasticsearch."""
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -17,9 +17,13 @@ from shared.utils import (
 from shared.auth.jwt import setup_token_revocation
 
 from app.core.database import SearchIndexModel
+from app.core.elasticsearch_engine import ElasticSearchEngine
 from app.routes.search import router as search_router, set_dependencies
 
 SERVICE_NAME = "search"
+
+# Global ES engine instance
+_es_engine = ElasticSearchEngine()
 
 
 @asynccontextmanager
@@ -41,12 +45,20 @@ async def lifespan(app: FastAPI):
     kafka_producer = KafkaProducer(service_name=f"{SERVICE_NAME}-service")
     await kafka_producer.start()
 
+    # Start Elasticsearch engine (falls back to PostgreSQL if unavailable)
+    await _es_engine.start()
+    if _es_engine.is_available:
+        app.state.es_engine = _es_engine
+    else:
+        app.state.es_engine = None
+
     # Wire dependencies into routes
-    set_dependencies(session_factory, redis_client, kafka_producer)
+    set_dependencies(session_factory, redis_client, kafka_producer, _es_engine)
 
     yield
 
     # Cleanup
+    await _es_engine.stop()
     await kafka_producer.stop()
     await redis_client.disconnect()
     await dispose_engine(SERVICE_NAME)
