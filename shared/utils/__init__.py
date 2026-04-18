@@ -49,6 +49,7 @@ from shared.utils.kafka_client import (
     serialize_event,
     deserialize_event,
     ensure_topics_exist,
+    get_dlq_topic,
 )
 
 # Observability
@@ -62,6 +63,7 @@ from shared.utils.observability import (
     get_histogram,
     record_metric,
     HealthStatus,
+    HealthChecker,
     create_health_router,
 )
 
@@ -133,6 +135,7 @@ __all__ = [
     "serialize_event",
     "deserialize_event",
     "ensure_topics_exist",
+    "get_dlq_topic",
     # Observability
     "setup_tracing",
     "setup_logging",
@@ -143,6 +146,7 @@ __all__ = [
     "get_histogram",
     "record_metric",
     "HealthStatus",
+    "HealthChecker",
     "create_health_router",
     # Middleware
     "TenantMiddleware",

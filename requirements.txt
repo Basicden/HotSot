@@ -16,6 +16,12 @@ redis[hiredis]==5.0.1
 # Kafka
 aiokafka==0.9.0
 
+# Search (Elasticsearch)
+elasticsearch[async]>=8.12.0
+
+# Email (Notification Service)
+aiosmtplib>=3.0.1
+
 # ML Pipeline
 lightgbm==4.2.0
 scikit-learn==1.4.0
@@ -45,6 +51,9 @@ httpx==0.26.0
 
 # Payment Integration (Razorpay)
 razorpay==1.3.0
+
+# WebSocket (Realtime Service)
+websockets>=12.0
 
 # Testing
 pytest==7.4.4

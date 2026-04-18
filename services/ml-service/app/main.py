@@ -8,18 +8,18 @@ ETA for model retraining.
 import json
 import logging
 import os
-import threading
+import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 import redis as redis_lib
-from kafka import KafkaConsumer
+from aiokafka import AIOKafkaConsumer
 
 from app.routes.ml import router as ml_router
 from shared.auth.jwt import setup_token_revocation
 from shared.utils.redis_client import RedisClient as SharedRedisClient
-from shared.types.schemas import KAFKA_TOPICS, EventType
+from shared.types.schemas import EventType
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(name)s  │  %(message)s")
@@ -27,19 +27,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(
 redis_client: redis_lib.Redis | None = None
 
 # ─── Kafka Consumer for Feedback Loop ────────────────────────
-_consumer_thread: threading.Thread | None = None
+_consumer_task: asyncio.Task | None = None
 _consumer_running = False
 
 # Feedback events that improve ETA model accuracy
 # V2: Subscribe to standardized domain topics and filter by event_type
 FEEDBACK_TOPICS = [
-    KAFKA_TOPICS["hotsot.order.events.v1"],   # filter: ORDER_PICKED
-    KAFKA_TOPICS["hotsot.shelf.events.v1"],   # filter: SHELF_EXPIRED
+    "hotsot.order.events.v1",   # filter: ORDER_PICKED
+    "hotsot.shelf.events.v1",   # filter: SHELF_EXPIRED
 ]
 
 
-def _kafka_consumer_loop():
-    """Background thread: consume feedback events for ML model improvement.
+async def _kafka_consumer_loop():
+    """Async Kafka consumer for ML model feedback loop.
 
     - order.picked: Records actual prep time (IN_PREP → PICKED) vs predicted
       ETA. This is the primary positive training signal.
@@ -47,49 +47,45 @@ def _kafka_consumer_loop():
       picked within TTL). This negative signal is weighted 3x in training.
     """
     global _consumer_running
-    bootstrap = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"))
     try:
-        consumer = KafkaConsumer(
+        consumer = AIOKafkaConsumer(
             *FEEDBACK_TOPICS,
             bootstrap_servers=bootstrap.split(","),
             group_id="ml-service-feedback",
             auto_offset_reset="latest",
             value_deserializer=lambda m: json.loads(m.decode("utf-8")),
             enable_auto_commit=True,
-            consumer_timeout_ms=1000,
         )
+        await consumer.start()
         logger.info("ML Kafka consumer started: listening on %s", FEEDBACK_TOPICS)
     except Exception as exc:
         logger.warning("ML Kafka consumer init failed (non-fatal): %s", exc)
         return
 
-    while _consumer_running:
-        try:
-            for msg in consumer:
-                if not _consumer_running:
-                    break
-                event = msg.value
-                order_id = event.get("order_id")
-                kitchen_id = event.get("kitchen_id")
-                if not order_id:
-                    continue
-
-                # V2: Filter by event_type instead of topic name
-                event_type = event.get("event_type", "")
-                if event_type == EventType.ORDER_PICKED.value:
-                    _handle_order_picked(event)
-                elif event_type == EventType.SHELF_EXPIRED.value:
-                    _handle_shelf_expired(event)
-
-        except StopIteration:
-            pass
-        except Exception as exc:
-            logger.error("ML consumer loop error: %s", exc)
-
     try:
-        consumer.close()
-    except Exception as e:
-        logger.warning(f"Error during shutdown: {e}")
+        async for msg in consumer:
+            if not _consumer_running:
+                break
+            event = msg.value
+            order_id = event.get("order_id")
+            kitchen_id = event.get("kitchen_id")
+            if not order_id:
+                continue
+
+            # V2: Filter by event_type instead of topic name
+            event_type = event.get("event_type", "")
+            if event_type == EventType.ORDER_PICKED.value:
+                _handle_order_picked(event)
+            elif event_type == EventType.SHELF_EXPIRED.value:
+                _handle_shelf_expired(event)
+    except Exception as exc:
+        logger.error("ML consumer loop error: %s", exc)
+    finally:
+        try:
+            await consumer.stop()
+        except Exception as e:
+            logger.warning(f"Error during shutdown: {e}")
     logger.info("ML Kafka consumer stopped")
 
 
@@ -136,7 +132,7 @@ def _handle_order_picked(event: dict):
                     "actual_seconds": actual_seconds,
                     "error_seconds": error_seconds,
                     "weight": 1,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }))
             except redis_lib.RedisError as exc:
                 logger.error(
@@ -175,7 +171,7 @@ def _handle_shelf_expired(event: dict):
             "kitchen_id": kitchen_id,
             "reason": "shelf_expired",
             "weight": 3,  # 3x weight in training
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
     except redis_lib.RedisError as exc:
         logger.error(
@@ -187,7 +183,7 @@ def _handle_shelf_expired(event: dict):
 # ─── FastAPI Lifespan ────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, _consumer_thread, _consumer_running
+    global redis_client, _consumer_task, _consumer_running
 
     logger.info("MLService starting — Training + Inference + Feedback Loop ready")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/5")
@@ -214,17 +210,20 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("JWT token revocation Redis connection failed: %s", exc)
 
-    # Start Kafka consumer for feedback loop
+    # Start Kafka consumer for feedback loop (async)
     _consumer_running = True
-    _consumer_thread = threading.Thread(target=_kafka_consumer_loop, daemon=True)
-    _consumer_thread.start()
+    _consumer_task = asyncio.create_task(_kafka_consumer_loop())
 
     yield
 
     # Shutdown
     _consumer_running = False
-    if _consumer_thread:
-        _consumer_thread.join(timeout=5)
+    if _consumer_task and not _consumer_task.done():
+        _consumer_task.cancel()
+        try:
+            await asyncio.wait_for(_consumer_task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
     if redis_client:
         try:
             redis_client.close()

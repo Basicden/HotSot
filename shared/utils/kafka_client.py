@@ -29,6 +29,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import traceback
@@ -347,6 +348,123 @@ class KafkaProducer:
                 )
         except Exception as e:
             logger.warning(f"Error during shutdown: {e}")
+
+
+class KafkaConsumerManager:
+    """
+    Manages Kafka consumers for a service with standardized setup.
+
+    Provides a simplified interface for subscribing to multiple topics
+    with a single consumer group, automatic topic validation, and
+    graceful lifecycle management.
+
+    Usage:
+        manager = KafkaConsumerManager("kitchen-service")
+        await manager.start()
+        manager.subscribe(
+            topics=["hotsot.order.events.v1", "hotsot.kitchen.events.v1"],
+            handler=my_handler,
+        )
+        await manager.run()  # blocking consume loop
+        await manager.stop()
+    """
+
+    def __init__(
+        self,
+        service_name: str,
+        group_id: Optional[str] = None,
+        max_retries: int = 3,
+    ):
+        self._service_name = service_name
+        self._group_id = group_id or f"{service_name}-group"
+        self._max_retries = max_retries
+        self._consumers: List[KafkaConsumer] = []
+        self._running = False
+
+    async def start(self) -> None:
+        """Initialize the consumer manager (no consumers started yet)."""
+        self._running = True
+        logger.info(
+            f"KafkaConsumerManager ready: service={self._service_name} "
+            f"group={self._group_id}"
+        )
+
+    def subscribe(
+        self,
+        topics: List[str],
+        handler: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+    ) -> KafkaConsumer:
+        """
+        Subscribe to a list of topics with a handler.
+
+        Args:
+            topics: List of topic names to subscribe to.
+            handler: Async function to handle consumed messages.
+
+        Returns:
+            KafkaConsumer instance (not yet started).
+        """
+        consumer = KafkaConsumer(
+            service_name=self._service_name,
+            topics=topics,
+            group_id=self._group_id,
+            handler=handler,
+            max_retries=self._max_retries,
+        )
+        self._consumers.append(consumer)
+        return consumer
+
+    async def start_all(self) -> None:
+        """Start all registered consumers."""
+        for consumer in self._consumers:
+            await consumer.start()
+        logger.info(
+            f"KafkaConsumerManager started {len(self._consumers)} consumers "
+            f"for service={self._service_name}"
+        )
+
+    async def run(self) -> None:
+        """Run all consumer loops concurrently."""
+        if not self._consumers:
+            logger.warning(
+                f"KafkaConsumerManager has no consumers for service={self._service_name}"
+            )
+            return
+
+        tasks = [consumer.consume_loop() for consumer in self._consumers]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def stop(self) -> None:
+        """Stop all consumers gracefully."""
+        self._running = False
+        for consumer in self._consumers:
+            try:
+                await consumer.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping consumer: {e}")
+        self._consumers.clear()
+        logger.info(f"KafkaConsumerManager stopped for service={self._service_name}")
+
+
+def get_dlq_topic(topic: str) -> str:
+    """
+    Get the DLQ topic name for a given source topic.
+
+    Convention: hotsot.{domain}.events.v1 → hotsot.dlq.{domain}.events.v1
+
+    Args:
+        topic: Source topic name.
+
+    Returns:
+        DLQ topic name.
+    """
+    if topic.startswith("hotsot.dlq."):
+        return topic  # Already a DLQ topic
+    if topic.startswith("hotsot."):
+        parts = topic.split(".", 1)
+        if len(parts) == 2:
+            return f"hotsot.dlq.{parts[1]}"
+    return f"hotsot.dlq.{topic}"
 
 
 class EventPublisher(KafkaProducer):

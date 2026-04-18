@@ -439,6 +439,106 @@ class HealthStatus:
     )
 
 
+class HealthChecker:
+    """
+    Production health checker for Kubernetes probes.
+
+    Provides three probe endpoints:
+    - Liveness (/health/live): Is the process alive?
+    - Readiness (/health/ready): Is it ready to accept traffic?
+    - Startup (/health/startup): Has it finished initialization?
+
+    Usage:
+        health_checker = HealthChecker("order-service")
+        health_checker.mark_ready(True)
+
+        @app.get("/health/live")
+        async def liveness():
+            return health_checker.liveness()
+
+        @app.get("/health/ready")
+        async def readiness():
+            db_ok = await health_checker.check_db("order")
+            redis_ok = await health_checker.check_redis(redis_client)
+            return health_checker.readiness(db_ok=db_ok, redis_ok=redis_ok)
+    """
+
+    def __init__(self, service_name: str = "hotsot"):
+        self._service_name = service_name
+        self._ready = False
+        self._started_at = datetime.now(timezone.utc).isoformat()
+        self._version = os.getenv("SERVICE_VERSION", "2.0.0")
+        self._environment = os.getenv("ENVIRONMENT", "development")
+
+    def mark_ready(self, ready: bool) -> None:
+        """Mark the service as ready (or not) to accept traffic."""
+        self._ready = ready
+        logger.info(f"HealthChecker: service={self._service_name} ready={ready}")
+
+    def liveness(self) -> Dict[str, Any]:
+        """Return liveness status — is the process alive?"""
+        return {
+            "status": "alive",
+            "service": self._service_name,
+            "version": self._version,
+            "uptime_since": self._started_at,
+        }
+
+    def readiness(self, db_ok: bool = True, redis_ok: bool = True, **extra_checks: bool) -> Dict[str, Any]:
+        """Return readiness status — can the service accept traffic?"""
+        checks = {
+            "database": "healthy" if db_ok else "unhealthy",
+            "redis": "healthy" if redis_ok else "unhealthy",
+        }
+        checks.update({k: "healthy" if v else "unhealthy" for k, v in extra_checks.items()})
+
+        all_healthy = all(v == "healthy" for v in checks.values()) and self._ready
+
+        return {
+            "status": "ready" if all_healthy else "not_ready",
+            "service": self._service_name,
+            "version": self._version,
+            "environment": self._environment,
+            "ready": self._ready,
+            "checks": checks,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def startup(self) -> Dict[str, Any]:
+        """Return startup status — has initialization completed?"""
+        return {
+            "status": "started" if self._ready else "starting",
+            "service": self._service_name,
+            "version": self._version,
+            "started_at": self._started_at,
+        }
+
+    async def check_db(self, service_name: str) -> bool:
+        """Check database connectivity."""
+        try:
+            from shared.utils.database import get_engine
+            engine = get_engine(service_name)
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return True
+        except Exception as e:
+            logger.warning(f"DB health check failed for {service_name}: {e}")
+            return False
+
+    async def check_redis(self, redis_client: Any) -> bool:
+        """Check Redis connectivity."""
+        try:
+            if hasattr(redis_client, 'health_check'):
+                result = await redis_client.health_check()
+                return result.get("status") == "healthy"
+            elif hasattr(redis_client, 'ping'):
+                return await redis_client.ping()
+            return False
+        except Exception as e:
+            logger.warning(f"Redis health check failed: {e}")
+            return False
+
+
 def create_health_router(service_name: str = "hotsot") -> APIRouter:
     """
     Create a FastAPI router with health check endpoints.

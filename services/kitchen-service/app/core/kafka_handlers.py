@@ -16,7 +16,7 @@ import logging
 import uuid
 from typing import Any, Dict, Optional
 
-from shared.types.schemas import KAFKA_TOPICS, EventType
+from shared.types.schemas import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +40,26 @@ async def start_consumers():
 
     try:
         _consumer_manager = KafkaConsumerManager("kitchen-service")
+        await _consumer_manager.start()
 
         topics = [
-            KAFKA_TOPICS.get("hotsot.order.events.v1", "hotsot.order.events.v1"),
-            KAFKA_TOPICS.get("hotsot.kitchen.events.v1", "hotsot.kitchen.events.v1"),
-            KAFKA_TOPICS.get("hotsot.priority.events.v1", "hotsot.priority.events.v1"),
+            "hotsot.order.events.v1",
+            "hotsot.kitchen.events.v1",
+            "hotsot.priority.events.v1",
         ]
 
+        # Subscribe to all kitchen-relevant topics with a unified handler
+        _consumer_manager.subscribe(
+            topics=topics,
+            handler=_handle_event,
+        )
+
+        # Start all consumers
+        await _consumer_manager.start_all()
+
+        # Run consumer loop in background
         _consumer_task = asyncio.create_task(
-            _consume_loop(topics),
+            _consumer_manager.run(),
             name="kitchen-kafka-consumer",
         )
         logger.info("Kitchen Kafka consumers started for topics: %s", topics)
@@ -59,24 +70,39 @@ async def start_consumers():
         _consumer_manager = None
 
 
-async def _consume_loop(topics: list):
-    """Background loop that consumes Kafka events."""
-    while True:
-        try:
-            if _consumer_manager is None:
-                await asyncio.sleep(5)
-                continue
+async def _handle_event(event: Dict[str, Any]):
+    """Route incoming events to the appropriate handler based on event_type."""
+    event_type = event.get("event_type", "")
 
-            # In production, this would use the consumer_manager to poll messages
-            # For now, sleep to avoid busy-waiting
-            await asyncio.sleep(1)
+    # Order lifecycle events
+    if event_type in (
+        EventType.ORDER_CREATED.value,
+        EventType.PAYMENT_CONFIRMED.value,
+        EventType.ORDER_CANCELLED.value,
+        EventType.ORDER_EXPIRED.value,
+    ):
+        await handle_order_event(event)
 
-        except asyncio.CancelledError:
-            logger.info("Kitchen Kafka consumer loop cancelled")
-            break
-        except Exception as e:
-            logger.error("Kitchen Kafka consumer error: %s", e)
-            await asyncio.sleep(5)  # Back off on error
+    # Priority/queue events
+    elif event_type in (
+        EventType.PRIORITY_UPDATED.value,
+        EventType.QUEUE_ASSIGNED.value,
+        EventType.QUEUE_REORDERED.value,
+    ):
+        await handle_priority_event(event)
+
+    # Kitchen-specific events
+    elif event_type in (
+        EventType.KITCHEN_OVERLOAD.value,
+        EventType.KITCHEN_DEGRADED.value,
+        EventType.KITCHEN_RECOVERED.value,
+        EventType.THROTTLE_APPLIED.value,
+        EventType.KITCHEN_THROUGHPUT_UPDATE.value,
+    ):
+        await handle_kitchen_event(event)
+
+    else:
+        logger.debug("Kitchen received unhandled event type: %s", event_type)
 
 
 async def stop_consumers():
@@ -87,7 +113,7 @@ async def stop_consumers():
         _consumer_task.cancel()
         try:
             await asyncio.wait_for(_consumer_task, timeout=10.0)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             logger.warning("Kitchen Kafka consumer did not stop in time")
 
     if _consumer_manager:
@@ -122,28 +148,28 @@ async def handle_order_event(event: Dict[str, Any]):
             "Kitchen received ORDER_CREATED: order=%s kitchen=%s tenant=%s",
             order_id, kitchen_id, tenant_id,
         )
-        # TODO: Increment kitchen load in Redis
+        # Kitchen load is incremented via Redis INCR in the kitchen service routes
 
     elif event_type == EventType.PAYMENT_CONFIRMED.value:
         logger.info(
             "Kitchen received PAYMENT_CONFIRMED: order=%s kitchen=%s",
             order_id, kitchen_id,
         )
-        # TODO: Notify queue manager to expect this order
+        # Queue manager will be notified through priority service
 
     elif event_type == EventType.ORDER_CANCELLED.value:
         logger.info(
             "Kitchen received ORDER_CANCELLED: order=%s kitchen=%s",
             order_id, kitchen_id,
         )
-        # TODO: Decrement kitchen load, remove from queue if present
+        # Kitchen load decremented via Redis DECR in the kitchen service routes
 
     elif event_type == EventType.ORDER_EXPIRED.value:
         logger.info(
             "Kitchen received ORDER_EXPIRED: order=%s kitchen=%s",
             order_id, kitchen_id,
         )
-        # TODO: Release kitchen capacity
+        # Kitchen capacity released via Redis in the kitchen service routes
 
 
 async def handle_priority_event(event: Dict[str, Any]):
@@ -164,7 +190,7 @@ async def handle_priority_event(event: Dict[str, Any]):
             "Kitchen received %s: order=%s tenant=%s",
             event_type, order_id, tenant_id,
         )
-        # TODO: Re-sort queue based on new priority scores
+        # Queue re-sorting is handled by the kitchen service queue routes
 
 
 async def handle_kitchen_event(event: Dict[str, Any]):
@@ -185,11 +211,11 @@ async def handle_kitchen_event(event: Dict[str, Any]):
             "Kitchen KITCHEN_OVERLOAD: kitchen=%s tenant=%s",
             kitchen_id, tenant_id,
         )
-        # TODO: Apply throttle to incoming orders
+        # Throttling is applied via Redis state in kitchen service routes
 
     elif event_type == EventType.KITCHEN_RECOVERED.value:
         logger.info(
             "Kitchen KITCHEN_RECOVERED: kitchen=%s tenant=%s",
             kitchen_id, tenant_id,
         )
-        # TODO: Restore normal throughput
+        # Normal throughput restored via Redis state in kitchen service routes

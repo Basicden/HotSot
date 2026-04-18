@@ -392,8 +392,11 @@ class RazorpayGateway:
             True if signature is valid, False otherwise.
         """
         if not self._webhook_secret:
-            logger.warning("Webhook secret not configured — skipping signature verification")
-            return True  # Fail-open if not configured (fix in production)
+            logger.error(
+                "SECURITY: Webhook secret not configured — REJECTING webhook. "
+                "Set RAZORPAY_WEBHOOK_SECRET environment variable to accept webhooks."
+            )
+            return False  # Fail-closed: reject unverified webhooks
 
         expected = hmac.new(
             self._webhook_secret.encode(),

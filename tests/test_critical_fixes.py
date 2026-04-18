@@ -309,7 +309,7 @@ class TestComplianceVerification:
         """Valid FSSAI license format should pass."""
         # Import the compliance service verification
         import sys
-        sys.path.insert(0, '/home/z/my-project/hotsot-repo')
+        sys.path.insert(0, '/home/z/my-project/HotSot')
         from services.compliance-service.app.routes.compliance import verify_fssai_license
         # 14-digit valid format: state(2) + reg(6) + year(4) + type(2)
         result = verify_fssai_license("07202320240101")
@@ -319,7 +319,7 @@ class TestComplianceVerification:
     def test_fssai_invalid_format(self):
         """Invalid FSSAI format should fail."""
         import sys
-        sys.path.insert(0, '/home/z/my-project/hotsot-repo')
+        sys.path.insert(0, '/home/z/my-project/HotSot')
         from services.compliance-service.app.routes.compliance import verify_fssai_license
         result = verify_fssai_license("ABC123")
         assert result["valid"] is False
@@ -328,7 +328,7 @@ class TestComplianceVerification:
     def test_fssai_invalid_state_code(self):
         """FSSAI with invalid state code should fail."""
         import sys
-        sys.path.insert(0, '/home/z/my-project/hotsot-repo')
+        sys.path.insert(0, '/home/z/my-project/HotSot')
         from services.compliance-service.app.routes.compliance import verify_fssai_license
         result = verify_fssai_license("99202320240101")
         assert result["valid"] is False
@@ -337,7 +337,7 @@ class TestComplianceVerification:
     def test_gst_valid_format(self):
         """Valid GSTIN should pass format and checksum check."""
         import sys
-        sys.path.insert(0, '/home/z/my-project/hotsot-repo')
+        sys.path.insert(0, '/home/z/my-project/HotSot')
         from services.compliance-service.app.routes.compliance import verify_gst_number
         # Using a well-known test GSTIN: 22AAAAA0000A1Z5
         result = verify_gst_number("22AAAAA0000A1Z5")
@@ -348,7 +348,7 @@ class TestComplianceVerification:
     def test_gst_invalid_format(self):
         """Invalid GSTIN format should fail."""
         import sys
-        sys.path.insert(0, '/home/z/my-project/hotsot-repo')
+        sys.path.insert(0, '/home/z/my-project/HotSot')
         from services.compliance-service.app.routes.compliance import verify_gst_number
         result = verify_gst_number("INVALID")
         assert result["valid"] is False
