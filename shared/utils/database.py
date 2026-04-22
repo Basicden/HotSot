@@ -181,7 +181,7 @@ class BaseModelMixin(BaseModel):
     Some services import BaseModelMixin instead of BaseModel.
     This class ensures both imports work identically.
     """
-    pass
+    __abstract__ = True
 
 
 class OptimisticLockMixin:
@@ -562,16 +562,61 @@ class Base(DeclarativeBase):
 
 
 # Legacy engine/session for backward compat
+# Lazy initialization to avoid database connection at import time
+# (prevents test failures when DATABASE_URL is not configured)
 from shared.utils.config import settings as _legacy_settings
 
-engine = create_async_engine(
-    _legacy_settings.DATABASE_URL,
-    echo=_legacy_settings.DEBUG,
-    pool_size=20,
-    max_overflow=10,
-)
+_engine = None
+_async_session = None
 
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+def _get_legacy_engine():
+    """Lazy-initialize the legacy engine on first access."""
+    global _engine
+    if _engine is None:
+        try:
+            _engine = create_async_engine(
+                _legacy_settings.DATABASE_URL,
+                echo=_legacy_settings.DEBUG,
+                pool_size=20,
+                max_overflow=10,
+            )
+        except Exception:
+            _engine = None
+    return _engine
+
+
+def _get_legacy_session():
+    """Lazy-initialize the legacy session factory on first access."""
+    global _async_session
+    if _async_session is None:
+        eng = _get_legacy_engine()
+        if eng is not None:
+            _async_session = async_sessionmaker(eng, class_=AsyncSession, expire_on_commit=False)
+    return _async_session
+
+
+# Properties for backward compat — lazy evaluation
+class _LegacyEngine:
+    """Proxy that lazily creates the engine on first attribute access."""
+    def __getattr__(self, name):
+        eng = _get_legacy_engine()
+        if eng is None:
+            raise RuntimeError("Database engine not available — DATABASE_URL not configured")
+        return getattr(eng, name)
+
+
+class _LegacySession:
+    """Proxy that lazily creates the session factory on first call."""
+    def __call__(self, **kwargs):
+        factory = _get_legacy_session()
+        if factory is None:
+            raise RuntimeError("Database session not available — DATABASE_URL not configured")
+        return factory(**kwargs)
+
+
+engine = _LegacyEngine()
+async_session = _LegacySession()
 
 
 async def get_db() -> AsyncSession:

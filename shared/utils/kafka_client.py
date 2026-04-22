@@ -4,6 +4,7 @@ HotSot Kafka Client — Production-grade event streaming.
 Features:
     - Exactly-once producer with idempotent publishing
     - Manual-commit consumer with DLQ routing
+    - Event-level deduplication via EventDedupStore
     - EventEnvelope serialization/deserialization
     - Topic management with auto-creation
     - Partition key strategy (order_id, kitchen_id, vendor_id)
@@ -32,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
@@ -71,6 +73,104 @@ def deserialize_event(data: bytes) -> Dict[str, Any]:
         Deserialized dictionary.
     """
     return json.loads(data.decode("utf-8"))
+
+
+# ═══════════════════════════════════════════════════════════════
+# EVENT DEDUPLICATION
+# ═══════════════════════════════════════════════════════════════
+
+class EventDedupStore:
+    """
+    In-memory event deduplication store with configurable TTL.
+
+    Tracks processed event_ids to prevent duplicate processing caused
+    by Kafka's at-least-once delivery semantics combined with consumer
+    restarts. Each entry expires after the configured TTL, ensuring
+    the store does not grow unbounded over time.
+
+    Thread-safety is provided via asyncio.Lock for safe use in
+    concurrent async consumer loops.
+
+    Usage:
+        store = EventDedupStore(ttl_seconds=3600)
+        if await store.is_duplicate(event_id):
+            # skip processing
+            return
+        await handler(msg)
+        await store.mark_processed(event_id)
+
+    Args:
+        ttl_seconds: Time-to-live in seconds for each tracked event_id.
+                     Default is 3600 (1 hour).
+    """
+
+    def __init__(self, ttl_seconds: int = 3600) -> None:
+        self._ttl_seconds = ttl_seconds
+        # Dict mapping event_id -> expiry timestamp (monotonic time)
+        self._store: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def is_duplicate(self, event_id: str) -> bool:
+        """
+        Check whether an event_id has already been processed.
+
+        An event is considered a duplicate if it exists in the store
+        and its TTL has not yet expired. Expired entries are treated
+        as non-duplicate (they will be cleaned up lazily).
+
+        Args:
+            event_id: The unique identifier of the event.
+
+        Returns:
+            True if the event was previously processed (duplicate),
+            False otherwise.
+        """
+        async with self._lock:
+            expiry = self._store.get(event_id)
+            if expiry is None:
+                return False
+            if time.monotonic() > expiry:
+                # Entry has expired — treat as non-duplicate
+                del self._store[event_id]
+                return False
+            return True
+
+    async def mark_processed(self, event_id: str) -> None:
+        """
+        Mark an event_id as successfully processed.
+
+        The entry will automatically expire after the configured TTL.
+
+        Args:
+            event_id: The unique identifier of the event.
+        """
+        async with self._lock:
+            self._store[event_id] = time.monotonic() + self._ttl_seconds
+
+    async def cleanup_expired(self) -> int:
+        """
+        Remove all expired entries from the store.
+
+        This should be called periodically (e.g., every few minutes) to
+        prevent unbounded memory growth from expired entries that were
+        not removed during lazy expiry in ``is_duplicate``.
+
+        Returns:
+            The number of entries removed.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            expired_keys = [
+                eid for eid, expiry in self._store.items() if now > expiry
+            ]
+            for key in expired_keys:
+                del self._store[key]
+            if expired_keys:
+                logger.debug(
+                    f"EventDedupStore: cleaned up {len(expired_keys)} "
+                    f"expired entries, {len(self._store)} remaining"
+                )
+            return len(expired_keys)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -497,10 +597,12 @@ class KafkaConsumerManager:
         service_name: str,
         group_id: Optional[str] = None,
         max_retries: int = 3,
+        dedup_ttl_seconds: int = 3600,
     ):
         self._service_name = service_name
         self._group_id = group_id or f"{service_name}-group"
         self._max_retries = max_retries
+        self._dedup_store = EventDedupStore(ttl_seconds=dedup_ttl_seconds)
         self._consumers: List[KafkaConsumer] = []
         self._running = False
 
@@ -533,6 +635,7 @@ class KafkaConsumerManager:
             group_id=self._group_id,
             handler=handler,
             max_retries=self._max_retries,
+            dedup_store=self._dedup_store,
         )
         self._consumers.append(consumer)
         return consumer
@@ -618,6 +721,7 @@ class KafkaConsumer:
         - Manual offset commit (at-least-once processing)
         - DLQ routing for failed messages
         - Configurable retry before DLQ
+        - Event-level deduplication via optional EventDedupStore
         - Graceful shutdown
         - Event deserialization with schema validation
     """
@@ -630,6 +734,7 @@ class KafkaConsumer:
         handler: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         max_retries: int = 3,
         dlq_suffix: str = ".dlq",
+        dedup_store: Optional[EventDedupStore] = None,
     ):
         self._service_name = service_name
         self._topics = topics
@@ -637,6 +742,7 @@ class KafkaConsumer:
         self._handler = handler
         self._max_retries = max_retries
         self._dlq_suffix = dlq_suffix
+        self._dedup_store = dedup_store
         self._consumer = None
         self._running = False
         self._retry_counts: Dict[str, int] = {}
@@ -689,6 +795,10 @@ class KafkaConsumer:
         """
         Main consumption loop. Processes messages and commits on success.
 
+        Before invoking the handler, the event_id is checked against the
+        deduplication store (if configured). Duplicate events are logged
+        at WARNING level and committed (skipped) to avoid reprocessing.
+
         Failed messages are routed to DLQ after max retries.
         """
         if not self._consumer:
@@ -700,9 +810,28 @@ class KafkaConsumer:
                 if not self._running:
                     break
 
+                # ── Event deduplication check ──
+                if self._dedup_store is not None:
+                    event_id = self._extract_event_id(msg)
+                    if await self._dedup_store.is_duplicate(event_id):
+                        logger.warning(
+                            f"Duplicate event detected and skipped: "
+                            f"event_id={event_id} topic={msg.topic} "
+                            f"offset={msg.offset} partition={msg.partition}"
+                        )
+                        # Commit to advance the offset so we don't see it again
+                        await self._consumer.commit()
+                        continue
+
                 try:
                     if self._handler:
                         await self._handler(msg.value)
+
+                    # Mark as processed in dedup store (after successful handler)
+                    if self._dedup_store is not None:
+                        event_id = self._extract_event_id(msg)
+                        await self._dedup_store.mark_processed(event_id)
+
                     await self._consumer.commit()
                     logger.debug(
                         f"Message processed: topic={msg.topic} "
@@ -721,6 +850,32 @@ class KafkaConsumer:
             logger.error(f"Consumer loop error: {e}")
         finally:
             self._running = False
+
+    @staticmethod
+    def _extract_event_id(msg: Any) -> str:
+        """
+        Extract a unique event identifier from a Kafka message.
+
+        Attempts to read ``event_id`` from the message value payload first.
+        If not present (e.g., non-standard message format), falls back to a
+        composite key of ``msg.key + msg.offset`` which is guaranteed unique
+        within a partition.
+
+        Args:
+            msg: The Kafka ConsumerMessage object.
+
+        Returns:
+            A string identifier for the event.
+        """
+        value = msg.value if hasattr(msg, "value") else {}
+        if isinstance(value, dict):
+            event_id = value.get("event_id")
+            if event_id:
+                return str(event_id)
+        # Fallback: key + offset composite
+        key = msg.key if hasattr(msg, "key") else None
+        offset = msg.offset if hasattr(msg, "offset") else "unknown"
+        return f"{key}:{offset}"
 
     async def _handle_failure(self, msg: Any, error: str) -> None:
         """

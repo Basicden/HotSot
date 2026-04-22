@@ -9,6 +9,7 @@ Includes:
     - Dict utilities
     - Timer context manager
     - String utilities
+    - Retry with exponential backoff and jitter
 
 Usage:
     from shared.utils.helpers import generate_id, now_iso, idempotency_key, Timer
@@ -31,16 +32,21 @@ Usage:
     with Timer("process_order") as t:
         await process_order(order_id)
     print(f"Took {t.elapsed:.2f}s")
+
+    # Retry with backoff
+    result = await retry_with_backoff(fetch_data, max_retries=3, base_delay=0.1)
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import random
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Callable, Coroutine, Dict, Generator, Optional
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -526,3 +532,100 @@ def moving_average(values: list[float], window: int = 5) -> list[float]:
         result.append(sum(window_vals) / len(window_vals))
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# RETRY WITH EXPONENTIAL BACKOFF AND JITTER
+# ═══════════════════════════════════════════════════════════════
+
+async def retry_with_backoff(
+    func: Callable[..., Coroutine],
+    max_retries: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 5.0,
+    jitter: bool = True,
+    retryable_exceptions: tuple = (Exception,),
+    on_retry: Optional[Callable] = None,
+) -> Any:
+    """
+    Retry an async function with exponential backoff and jitter.
+
+    Prevents starvation/livelock under high contention by:
+    - Exponential delay: base_delay * 2^attempt
+    - Random jitter: ±50% of calculated delay
+    - Max delay cap: prevents unreasonably long waits
+    - Configurable retryable exceptions
+
+    Args:
+        func: Async function to retry.
+        max_retries: Maximum number of retry attempts.
+        base_delay: Base delay in seconds (first retry).
+        max_delay: Maximum delay cap in seconds.
+        jitter: Whether to add random jitter (recommended: True).
+        retryable_exceptions: Tuple of exception types to retry on.
+        on_retry: Optional callback called on each retry (attempt, delay, error).
+
+    Returns:
+        Result of the function.
+
+    Raises:
+        Last exception if all retries exhausted.
+
+    Usage:
+        result = await retry_with_backoff(
+            fetch_data,
+            max_retries=3,
+            base_delay=0.1,
+            retryable_exceptions=(ConnectionError, TimeoutError),
+        )
+
+        # With on_retry callback
+        async def on_retry(attempt, delay, error):
+            logger.warning(f"Retry {attempt}: {error}, waiting {delay:.2f}s")
+
+        result = await retry_with_backoff(
+            fetch_data,
+            max_retries=5,
+            on_retry=on_retry,
+        )
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return await func()
+        except retryable_exceptions as e:
+            last_error = e
+
+            if attempt >= max_retries:
+                _logger.error(
+                    f"retry_with_backoff exhausted after {max_retries + 1} attempts: {e}"
+                )
+                raise
+
+            # Calculate exponential backoff delay
+            delay = min(base_delay * (2 ** attempt), max_delay)
+
+            # Apply jitter: ±50% of calculated delay
+            if jitter:
+                delay *= random.uniform(0.5, 1.5)
+
+            # Ensure delay doesn't exceed max_delay after jitter
+            delay = min(delay, max_delay)
+
+            _logger.debug(
+                f"retry_with_backoff attempt {attempt + 1}/{max_retries} "
+                f"failed: {e}. Retrying in {delay:.3f}s"
+            )
+
+            if on_retry is not None:
+                on_retry(attempt + 1, delay, e)
+
+            await asyncio.sleep(delay)
+
+    # This should be unreachable, but just in case
+    if last_error is not None:
+        raise last_error

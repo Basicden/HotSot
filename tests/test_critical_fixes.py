@@ -310,7 +310,7 @@ class TestComplianceVerification:
         # Import the compliance service verification
         import sys
         sys.path.insert(0, '/home/z/my-project/HotSot')
-        from services.compliance-service.app.routes.compliance import verify_fssai_license
+        from importlib import import_module as _im; verify_fssai_license = _im("services.compliance-service.app.routes.compliance").verify_fssai_license
         # 14-digit valid format: state(2) + reg(6) + year(4) + type(2)
         result = verify_fssai_license("07202320240101")
         assert result["valid"] is True
@@ -320,7 +320,7 @@ class TestComplianceVerification:
         """Invalid FSSAI format should fail."""
         import sys
         sys.path.insert(0, '/home/z/my-project/HotSot')
-        from services.compliance-service.app.routes.compliance import verify_fssai_license
+        from importlib import import_module as _im; verify_fssai_license = _im("services.compliance-service.app.routes.compliance").verify_fssai_license
         result = verify_fssai_license("ABC123")
         assert result["valid"] is False
         assert "14 digits" in result["error"]
@@ -329,7 +329,7 @@ class TestComplianceVerification:
         """FSSAI with invalid state code should fail."""
         import sys
         sys.path.insert(0, '/home/z/my-project/HotSot')
-        from services.compliance-service.app.routes.compliance import verify_fssai_license
+        from importlib import import_module as _im; verify_fssai_license = _im("services.compliance-service.app.routes.compliance").verify_fssai_license
         result = verify_fssai_license("99202320240101")
         assert result["valid"] is False
         assert "state code" in result["error"].lower()
@@ -338,7 +338,7 @@ class TestComplianceVerification:
         """Valid GSTIN should pass format and checksum check."""
         import sys
         sys.path.insert(0, '/home/z/my-project/HotSot')
-        from services.compliance-service.app.routes.compliance import verify_gst_number
+        from importlib import import_module as _im2; verify_gst_number = _im2("services.compliance-service.app.routes.compliance").verify_gst_number
         # Using a well-known test GSTIN: 22AAAAA0000A1Z5
         result = verify_gst_number("22AAAAA0000A1Z5")
         # Note: checksum may not match for this test number
@@ -349,7 +349,7 @@ class TestComplianceVerification:
         """Invalid GSTIN format should fail."""
         import sys
         sys.path.insert(0, '/home/z/my-project/HotSot')
-        from services.compliance-service.app.routes.compliance import verify_gst_number
+        from importlib import import_module as _im2; verify_gst_number = _im2("services.compliance-service.app.routes.compliance").verify_gst_number
         result = verify_gst_number("INVALID")
         assert result["valid"] is False
 

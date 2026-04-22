@@ -54,6 +54,7 @@ class EventProcessor:
 
         # 2. Validate order state transition
         if order_id and event_type:
+            is_new_order = order_id not in self.order_states
             current_state = self.order_states.get(order_id, "CREATED")
             valid_transitions = {
                 "CREATED": {"PAYMENT_PENDING", "CANCELLED", "FAILED"},
@@ -78,6 +79,7 @@ class EventProcessor:
                 "SLOT_RESERVED": "SLOT_RESERVED",
                 "QUEUE_ASSIGNED": "QUEUE_ASSIGNED",
                 "IN_PREP": "IN_PREP",
+                "PACKING": "PACKING",
                 "READY_FOR_PICKUP": "READY",
                 "ON_SHELF": "ON_SHELF",
                 "ARRIVAL_DETECTED": "ARRIVED",
@@ -90,26 +92,30 @@ class EventProcessor:
             }
 
             target_state = event_to_state.get(event_type)
-            if target_state and current_state in valid_transitions:
-                if target_state not in valid_transitions[current_state]:
-                    # Invalid transition → DLQ
-                    self.dlq.append({
-                        "event_id": event_id,
-                        "event_type": event_type,
-                        "order_id": order_id,
-                        "current_state": current_state,
-                        "target_state": target_state,
-                        "reason": "invalid_transition",
-                    })
-                    return {
-                        "status": "invalid_transition",
-                        "event_id": event_id,
-                        "current_state": current_state,
-                        "target_state": target_state,
-                    }
+            if target_state:
+                # New order: set initial state directly without transition check
+                if is_new_order:
+                    self.order_states[order_id] = target_state
+                elif current_state in valid_transitions:
+                    if target_state not in valid_transitions[current_state]:
+                        # Invalid transition → DLQ
+                        self.dlq.append({
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "order_id": order_id,
+                            "current_state": current_state,
+                            "target_state": target_state,
+                            "reason": "invalid_transition",
+                        })
+                        return {
+                            "status": "invalid_transition",
+                            "event_id": event_id,
+                            "current_state": current_state,
+                            "target_state": target_state,
+                        }
 
-                # Valid transition
-                self.order_states[order_id] = target_state
+                    # Valid transition
+                    self.order_states[order_id] = target_state
 
         # 3. Process event
         result = {
@@ -220,6 +226,7 @@ class TestOutOfOrderEvents:
                 "SLOT_RESERVED",
                 "QUEUE_ASSIGNED",
                 "IN_PREP",
+                "PACKING",
                 "READY_FOR_PICKUP",
                 "ON_SHELF",
                 "ARRIVAL_DETECTED",
