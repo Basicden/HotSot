@@ -8,7 +8,7 @@ from shared.utils.database import init_service_db
 from shared.utils.redis_client import RedisClient
 from shared.auth.jwt import setup_token_revocation
 from shared.utils.kafka_client import KafkaProducer
-from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
+from shared.utils.observability import setup_tracing, setup_logging, HealthChecker, setup_metrics
 from shared.utils.middleware import (
     ErrorHandlingMiddleware, CorrelationIDMiddleware,
     RequestLoggingMiddleware, RateLimitMiddleware, TenantMiddleware,
@@ -47,6 +47,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware, redis_client=redis_client, requests_per_minute=120)
 app.add_middleware(TenantMiddleware)
 setup_tracing("eta-service", app)
+setup_metrics(app, "eta-service")
 
 app.include_router(eta_router, prefix="/eta", tags=["eta"])
 

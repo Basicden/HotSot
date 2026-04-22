@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from shared.utils.config import get_settings
 from shared.utils.redis_client import RedisClient
 from shared.auth.jwt import setup_token_revocation
-from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
+from shared.utils.observability import setup_tracing, setup_logging, HealthChecker, setup_metrics
 from shared.utils.middleware import (
     ErrorHandlingMiddleware, CorrelationIDMiddleware,
     RequestLoggingMiddleware, TenantMiddleware,
@@ -33,6 +33,7 @@ app.add_middleware(CorrelationIDMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(TenantMiddleware)
 setup_tracing("realtime-service", app)
+setup_metrics(app, "realtime-service")
 
 app.include_router(ws_router, prefix="/ws", tags=["websocket"])
 app.include_router(sse_router, prefix="/sse", tags=["sse"])

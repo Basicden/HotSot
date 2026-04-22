@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
+from shared.utils.observability import setup_tracing, setup_logging, HealthChecker, setup_metrics
 from shared.utils.middleware import (
     ErrorHandlingMiddleware, CorrelationIDMiddleware,
     RequestLoggingMiddleware, RateLimitMiddleware, TenantMiddleware,
@@ -45,6 +45,7 @@ app.add_middleware(RateLimitMiddleware, redis_client=redis_client, requests_per_
 app.add_middleware(TenantMiddleware)
 
 setup_tracing("api-gateway", app)
+setup_metrics(app, "api-gateway")
 
 app.include_router(proxy_router, tags=["gateway"])
 

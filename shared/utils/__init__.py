@@ -56,6 +56,7 @@ from shared.utils.kafka_client import (
 from shared.utils.observability import (
     setup_tracing,
     setup_logging,
+    setup_metrics,
     get_tracer,
     get_logger,
     trace,
@@ -139,6 +140,7 @@ __all__ = [
     # Observability
     "setup_tracing",
     "setup_logging",
+    "setup_metrics",
     "get_tracer",
     "get_logger",
     "trace",

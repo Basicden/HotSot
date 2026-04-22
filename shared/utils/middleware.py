@@ -47,12 +47,12 @@ class TenantMiddleware(BaseHTTPMiddleware):
     Skip paths: /health, /ready, /live, /docs, /openapi.json
     """
 
-    SKIP_PATHS = {"/health", "/ready", "/live", "/docs", "/openapi.json", "/redoc"}
+    SKIP_PATHS = {"/health", "/ready", "/live", "/docs", "/openapi.json", "/redoc", "/metrics"}
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        # Skip health and docs endpoints
+        # Skip health, docs, and metrics endpoints
         if request.url.path in self.SKIP_PATHS:
             return await call_next(request)
 
@@ -90,7 +90,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         method=POST path=/orders status=201 duration_ms=45.2
     """
 
-    SKIP_PATHS = {"/health", "/ready", "/live"}
+    SKIP_PATHS = {"/health", "/ready", "/live", "/metrics"}
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -170,7 +170,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     When Redis is unavailable, requests are DENIED (fail-closed).
     """
 
-    SKIP_PATHS = {"/health", "/ready", "/live", "/docs", "/openapi.json"}
+    SKIP_PATHS = {"/health", "/ready", "/live", "/docs", "/openapi.json", "/metrics"}
 
     def __init__(self, app: ASGIApp, service_name: str = "hotsot"):
         super().__init__(app)

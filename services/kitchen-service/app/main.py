@@ -12,7 +12,7 @@ from shared.utils.database import init_service_db, get_session_factory
 from shared.utils.redis_client import RedisClient
 from shared.auth.jwt import setup_token_revocation
 from shared.utils.kafka_client import KafkaProducer, KafkaConsumerManager
-from shared.utils.observability import setup_tracing, setup_logging, HealthChecker
+from shared.utils.observability import setup_tracing, setup_logging, HealthChecker, setup_metrics
 from shared.utils.middleware import (
     ErrorHandlingMiddleware,
     CorrelationIDMiddleware,
@@ -74,6 +74,7 @@ app.add_middleware(TenantMiddleware)
 
 # Tracing
 setup_tracing("kitchen-service", app)
+setup_metrics(app, "kitchen-service")
 
 # Routes
 app.include_router(kitchen_router, prefix="/kitchen", tags=["kitchen"])

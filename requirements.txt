@@ -45,6 +45,7 @@ opentelemetry-instrumentation-redis==0.43b0
 opentelemetry-instrumentation-sqlalchemy==0.43b0
 structlog==24.1.0
 prometheus-client==0.19.0
+prometheus-fastapi-instrumentator==6.1.0
 
 # HTTP Client (API Gateway)
 httpx==0.26.0

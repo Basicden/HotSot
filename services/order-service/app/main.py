@@ -27,6 +27,7 @@ from shared.utils.observability import (
     setup_tracing,
     setup_logging,
     create_health_router,
+    setup_metrics,
 )
 from shared.utils.middleware import setup_middleware
 
@@ -184,6 +185,7 @@ app = FastAPI(
 # ═══════════════════════════════════════════════════════════════
 
 setup_middleware(app, SERVICE_NAME)
+setup_metrics(app, SERVICE_NAME)
 
 
 # ═══════════════════════════════════════════════════════════════

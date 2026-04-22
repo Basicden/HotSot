@@ -18,6 +18,7 @@ from aiokafka import AIOKafkaConsumer
 
 from app.routes.ml import router as ml_router
 from shared.auth.jwt import setup_token_revocation
+from shared.utils.observability import setup_metrics
 from shared.utils.redis_client import RedisClient as SharedRedisClient
 from shared.types.schemas import EventType
 
@@ -233,6 +234,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="HotSot ML Service", version="2.0.0", lifespan=lifespan)
+setup_metrics(app, "ml-service")
 app.include_router(ml_router, prefix="/ml", tags=["ml"])
 
 

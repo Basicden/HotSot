@@ -10,7 +10,7 @@ from shared.utils.database import init_service_db, get_session_factory, dispose_
 from shared.utils.redis_client import get_redis_client
 from shared.utils.kafka_client import KafkaProducer
 from shared.auth.jwt import setup_token_revocation
-from shared.utils.observability import setup_tracing, setup_logging, create_health_router
+from shared.utils.observability import setup_tracing, setup_logging, create_health_router, setup_metrics
 from shared.utils.middleware import setup_middleware
 
 from app.core.database import ALL_MODELS
@@ -85,6 +85,7 @@ app = FastAPI(title="HotSot Analytics Service", version="2.0.0", lifespan=lifesp
 
 # Middleware
 setup_middleware(app, SERVICE_NAME)
+setup_metrics(app, SERVICE_NAME)
 
 # Routes
 app.include_router(analytics_router, prefix="/analytics", tags=["analytics"])

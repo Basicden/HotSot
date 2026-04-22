@@ -7,6 +7,7 @@ from shared.utils import (
     setup_logging,
     setup_tracing,
     setup_middleware,
+    setup_metrics,
     get_session_factory,
     init_service_db,
     dispose_engine,
@@ -56,6 +57,7 @@ app = FastAPI(title="HotSot Menu Service", version="2.0.0", lifespan=lifespan)
 
 # Middleware
 setup_middleware(app, SERVICE_NAME)
+setup_metrics(app, SERVICE_NAME)
 
 # Health checks
 app.include_router(create_health_router(SERVICE_NAME))

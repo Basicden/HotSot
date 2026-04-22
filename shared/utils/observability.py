@@ -324,15 +324,63 @@ def trace(name: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# METRICS
+# METRICS (Prometheus)
 # ═══════════════════════════════════════════════════════════════
 
 _metrics_registry: Dict[str, Any] = {}
 
 
+def setup_metrics(app: Any, service_name: str = "hotsot") -> None:
+    """
+    Configure Prometheus metrics for a FastAPI app.
+
+    Uses prometheus-fastapi-instrumentator to auto-expose /metrics endpoint
+    with HTTP request duration, request count, and response size metrics.
+
+    The /metrics endpoint is added to the app and is accessible at:
+        GET /metrics
+
+    This must be called AFTER middleware setup but BEFORE including routers,
+    so that the instrumentator can track all routes.
+
+    Args:
+        app: FastAPI application instance.
+        service_name: The microservice identifier for metric labels.
+    """
+    try:
+        from prometheus_fastapi_instrumentator import Instrumentator
+
+        instrumentator = Instrumentator(
+            should_group_status_codes=True,
+            should_ignore_untemplated=True,
+            should_respect_env_var=True,
+            should_instrument_requests_inprogress=True,
+            excluded_handlers=["/health", "/ready", "/live", "/docs", "/openapi.json", "/redoc"],
+            env_var_name="ENABLE_METRICS",
+            inprogress_name=f"hotsot_{service_name}_http_requests_inprogress",
+            inprogress_labels=True,
+        )
+
+        instrumentator.instrument(app, metric_namespace=f"hotsot_{service_name}")
+        instrumentator.expose(app, endpoint="/metrics", include_in_schema=False)
+
+        logger.info(f"Prometheus metrics configured for service={service_name} at /metrics")
+
+    except ImportError:
+        logger.warning(
+            "prometheus-fastapi-instrumentator not installed — "
+            "install it with: pip install prometheus-fastapi-instrumentator. "
+            "Metrics endpoint will NOT be available."
+        )
+    except Exception as e:
+        logger.warning(f"Prometheus metrics setup failed: {e} — /metrics will NOT be available")
+
+
 def get_counter(name: str, description: str = "", unit: str = "1"):
     """
-    Get or create a counter metric.
+    Get or create a Prometheus counter metric.
+
+    Falls back to SimpleCounter if prometheus_client is not installed.
 
     Args:
         name: Metric name (e.g., "orders_created_total").
@@ -340,16 +388,26 @@ def get_counter(name: str, description: str = "", unit: str = "1"):
         unit: Metric unit.
 
     Returns:
-        Counter instance.
+        Counter instance (Prometheus Counter or SimpleCounter fallback).
     """
     if name not in _metrics_registry:
-        _metrics_registry[name] = SimpleCounter(name, description)
+        try:
+            from prometheus_client import Counter as PrometheusCounter
+            _metrics_registry[name] = PrometheusCounter(
+                name,
+                description or f"HotSot counter: {name}",
+                ["service", "tenant_id"],
+            )
+        except ImportError:
+            _metrics_registry[name] = SimpleCounter(name, description)
     return _metrics_registry[name]
 
 
 def get_histogram(name: str, description: str = "", unit: str = "ms"):
     """
-    Get or create a histogram metric.
+    Get or create a Prometheus histogram metric.
+
+    Falls back to SimpleHistogram if prometheus_client is not installed.
 
     Args:
         name: Metric name (e.g., "order_duration_ms").
@@ -357,10 +415,19 @@ def get_histogram(name: str, description: str = "", unit: str = "ms"):
         unit: Metric unit.
 
     Returns:
-        Histogram instance.
+        Histogram instance (Prometheus Histogram or SimpleHistogram fallback).
     """
     if name not in _metrics_registry:
-        _metrics_registry[name] = SimpleHistogram(name, description)
+        try:
+            from prometheus_client import Histogram as PrometheusHistogram
+            _metrics_registry[name] = PrometheusHistogram(
+                name,
+                description or f"HotSot histogram: {name}",
+                ["service", "tenant_id"],
+                buckets=(10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000),
+            )
+        except ImportError:
+            _metrics_registry[name] = SimpleHistogram(name, description)
     return _metrics_registry[name]
 
 
@@ -368,20 +435,43 @@ def record_metric(name: str, value: float, labels: Optional[Dict[str, str]] = No
     """
     Record a metric value.
 
+    For counters, increments by value.
+    For histograms, observes the value.
+    For simple metrics, records the value.
+
     Args:
         name: Metric name.
         value: Metric value.
-        labels: Optional labels for dimensional metrics.
+        labels: Optional labels for dimensional metrics (service, tenant_id).
     """
     metric = _metrics_registry.get(name)
-    if metric:
-        metric.record(value, labels)
-    else:
+    if not metric:
         logger.debug(f"Metric not found: {name}")
+        return
+
+    label_values = (
+        labels.get("service", "unknown"),
+        labels.get("tenant_id", "default"),
+    ) if labels else ("unknown", "default")
+
+    try:
+        # Prometheus Counter — use .inc()
+        if hasattr(metric, "inc"):
+            metric.labels(*label_values).inc(value)
+        # Prometheus Histogram — use .observe()
+        elif hasattr(metric, "observe"):
+            metric.labels(*label_values).observe(value)
+        # Simple fallback
+        elif hasattr(metric, "record"):
+            metric.record(value, labels)
+        elif hasattr(metric, "increment"):
+            metric.increment(int(value), labels)
+    except Exception as e:
+        logger.debug(f"Failed to record metric {name}: {e}")
 
 
 class SimpleCounter:
-    """Simple counter for demo mode."""
+    """Simple counter fallback when prometheus_client is not installed."""
 
     def __init__(self, name: str, description: str = ""):
         self.name = name
@@ -394,13 +484,16 @@ class SimpleCounter:
     def record(self, value: float, labels: Optional[Dict[str, str]] = None) -> None:
         self._value += int(value)
 
+    def inc(self, amount: float = 1) -> None:
+        self._value += int(amount)
+
     @property
     def value(self) -> int:
         return self._value
 
 
 class SimpleHistogram:
-    """Simple histogram for demo mode."""
+    """Simple histogram fallback when prometheus_client is not installed."""
 
     def __init__(self, name: str, description: str = ""):
         self.name = name
