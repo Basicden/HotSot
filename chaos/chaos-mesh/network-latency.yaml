@@ -1,0 +1,36 @@
+# HotSot Chaos — Network Latency (Slow Network Simulation)
+#
+# What: Injects 200ms latency between services
+# Tests: Timeout handling, circuit breaker, fallback behavior
+# Hypothesis: "Circuit breaker opens after 3 failures, fallback to cached data"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/network-latency.yaml
+#
+# Expected behavior:
+#   - Circuit breaker trips on timeout
+#   - Services degrade gracefully (cached data)
+#   - No infinite retry loops
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: hotsot-network-latency
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: network-latency
+spec:
+  action: delay
+  mode: all
+  duration: "2m"
+  delay:
+    latency: "200ms"
+    correlation: "50"
+    jitter: "50ms"
+  selector:
+    labelSelectors:
+      app.kubernetes.io/part-of: hotsot
+    namespaces:
+      - hotsot
+  direction: to

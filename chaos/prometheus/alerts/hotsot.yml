@@ -1,0 +1,183 @@
+# HotSot — Prometheus Alert Rules
+#
+# These alerts fire during chaos tests and production incidents.
+# Integrate with PagerDuty / Slack / Discord for notifications.
+
+groups:
+  # ─── Golden Signal Alerts ──────────────────────────────────
+  - name: golden_signals
+    interval: 30s
+    rules:
+      # HIGH LATENCY — p95 > 1s
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+          signal: latency
+        annotations:
+          summary: "High p95 latency on {{ $labels.instance }}"
+          description: "p95 latency is {{ $value }}s (threshold: 1s)"
+
+      # CRITICAL LATENCY — p99 > 5s
+      - alert: CriticalLatencyP99
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 5.0
+        for: 1m
+        labels:
+          severity: critical
+          signal: latency
+        annotations:
+          summary: "CRITICAL p99 latency on {{ $labels.instance }}"
+          description: "p99 latency is {{ $value }}s (threshold: 5s)"
+
+      # HIGH ERROR RATE — > 5%
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          signal: errors
+        annotations:
+          summary: "High error rate on {{ $labels.instance }}"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      # CRITICAL ERROR RATE — > 20%
+      - alert: CriticalErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.20
+        for: 1m
+        labels:
+          severity: critical
+          signal: errors
+        annotations:
+          summary: "CRITICAL error rate on {{ $labels.instance }}"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 20%)"
+
+      # LOW TRAFFIC — possible service down
+      - alert: LowTraffic
+        expr: rate(http_requests_total[5m]) < 1
+        for: 5m
+        labels:
+          severity: warning
+          signal: traffic
+        annotations:
+          summary: "Very low traffic on {{ $labels.instance }}"
+          description: "Only {{ $value }} req/s (expected > 1)"
+
+  # ─── Circuit Breaker Alerts ────────────────────────────────
+  - name: circuit_breaker
+    interval: 15s
+    rules:
+      - alert: CircuitBreakerOpen
+        expr: hotsot_circuit_breaker_state == 2
+        for: 30s
+        labels:
+          severity: warning
+          component: circuit-breaker
+        annotations:
+          summary: "Circuit breaker OPEN on {{ $labels.service }}"
+          description: "Circuit breaker for {{ $labels.service }}/{{ $labels.resource }} is OPEN (failing)"
+
+      - alert: CircuitBreakerHalfOpen
+        expr: hotsot_circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: info
+          component: circuit-breaker
+        annotations:
+          summary: "Circuit breaker HALF-OPEN on {{ $labels.service }}"
+          description: "Circuit breaker testing recovery for {{ $labels.service }}/{{ $labels.resource }}"
+
+  # ─── Kafka Alerts ──────────────────────────────────────────
+  - name: kafka
+    interval: 30s
+    rules:
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_group_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "High consumer lag on {{ $labels.group }}"
+          description: "Consumer group {{ $labels.group }} has {{ $value }} messages lagging"
+
+      - alert: KafkaDLQGrowing
+        expr: rate(kafka_topic_partition_current_offset{topic=~"hotsot.dlq.*"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "DLQ topic {{ $labels.topic }} is growing"
+          description: "Messages are being routed to dead letter queue"
+
+  # ─── Database Alerts ───────────────────────────────────────
+  - name: database
+    interval: 30s
+    rules:
+      - alert: DBConnectionPoolExhausted
+        expr: pg_stat_activity_count / pg_settings_max_connections > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "DB connection pool > 80% on {{ $labels.instance }}"
+          description: "{{ $value | humanizePercentage }} connections in use"
+
+      - alert: SlowQueries
+        expr: pg_stat_statements_mean_exec_time > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Slow queries detected on {{ $labels.instance }}"
+          description: "Average query time is {{ $value }}ms"
+
+  # ─── Redis Alerts ──────────────────────────────────────────
+  - name: redis
+    interval: 30s
+    rules:
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          component: redis
+        annotations:
+          summary: "Redis is DOWN on {{ $labels.instance }}"
+          description: "Redis instance is not responding to ping"
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis memory > 90% on {{ $labels.instance }}"
+          description: "Redis is using {{ $value | humanizePercentage }} of max memory"
+
+  # ─── Chaos Experiment Alerts ───────────────────────────────
+  - name: chaos_experiment
+    interval: 10s
+    rules:
+      - alert: ChaosExperimentActive
+        expr: hotsot_chaos_experiment_active == 1
+        labels:
+          severity: info
+          component: chaos
+        annotations:
+          summary: "Chaos experiment '{{ $labels.experiment }}' is active"
+          description: "Injecting {{ $labels.failure_type }} into {{ $labels.target }}"
+
+      - alert: RecoveryTimeExceeded
+        expr: hotsot_service_recovery_seconds > 30
+        for: 1m
+        labels:
+          severity: warning
+          component: chaos
+        annotations:
+          summary: "Service recovery took {{ $value }}s (threshold: 30s)"
+          description: "{{ $labels.service }} took too long to recover from failure"

@@ -96,6 +96,33 @@ services:
       timeout: 5s
       retries: 10
 
+  # ─── OBSERVABILITY (Chaos Engineering Stack) ───────────────
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./chaos/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./chaos/prometheus/alerts:/etc/prometheus/alerts
+      - promdata:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/hotsot-chaos.json
+    volumes:
+      - ./chaos/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
   # ─── API GATEWAY ────────────────────────────────────────────
   api-gateway:
     build:
@@ -443,3 +470,5 @@ volumes:
   pgdata:
   redisdata:
   esdata:
+  promdata:
+  grafanadata:

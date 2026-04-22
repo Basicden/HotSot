@@ -1,0 +1,32 @@
+# HotSot Chaos — Kafka Failure (Message Broker Outage)
+#
+# What: Kills Kafka broker pod
+# Tests: Fallback logging, event replay, message durability
+# Hypothesis: "Events logged to fallback file, no events lost, replay on recovery"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/kafka-failure.yaml
+#
+# Expected behavior:
+#   - KafkaProducer falls back to log file (/tmp/hotsot_kafka_fallback.log)
+#   - Events are NOT lost (fail-closed)
+#   - KafkaConsumer stops consuming (graceful)
+#   - On Kafka recovery, events are replayed from committed offsets
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: hotsot-kafka-failure
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: kafka-failure
+spec:
+  action: pod-kill
+  mode: one
+  duration: "90s"
+  selector:
+    labelSelectors:
+      app: kafka
+    namespaces:
+      - hotsot

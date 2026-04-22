@@ -1,0 +1,33 @@
+# HotSot Chaos — Database Failure Simulation
+#
+# What: Kills PostgreSQL pod to simulate DB outage
+# Tests: Database-per-service resilience, connection pool recovery
+# Hypothesis: "Services return 503 (degraded), no data corruption on recovery"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/db-failure.yaml
+#
+# Expected behavior:
+#   - Health checks report database: "unhealthy"
+#   - Read endpoints return cached data where possible
+#   - Write endpoints return 503
+#   - No partial writes / data corruption
+#   - Auto-recovery when DB comes back
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: hotsot-db-failure
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: db-failure
+spec:
+  action: pod-kill
+  mode: one
+  duration: "60s"
+  selector:
+    labelSelectors:
+      app: postgres
+    namespaces:
+      - hotsot

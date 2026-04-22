@@ -1,0 +1,38 @@
+# HotSot Chaos — Network Partition (Split Brain)
+#
+# What: Breaks network between service groups
+# Tests: Service isolation, event queue handling, eventual consistency
+# Hypothesis: "Isolated services queue events, replay on partition heal"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/network-partition.yaml
+#
+# Expected behavior:
+#   - Kafka consumers in partitioned services stop receiving events
+#   - DLQ accumulates unprocessable events
+#   - No data inconsistency
+#   - Event replay after partition heals
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: hotsot-network-partition
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: network-partition
+spec:
+  action: partition
+  duration: "3m"
+  direction: both
+  selector:
+    labelSelectors:
+      app.kubernetes.io/part-of: hotsot-core
+    namespaces:
+      - hotsot
+  target:
+    selector:
+      labelSelectors:
+        app.kubernetes.io/part-of: hotsot-infra
+      namespaces:
+        - hotsot

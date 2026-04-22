@@ -1,0 +1,209 @@
+{
+  "annotations": { "list": [] },
+  "description": "HotSot Chaos Engineering Dashboard — 5 panels: API Health, Service Health, Event System, Database, Chaos Impact",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    { "title": "Jaeger UI", "url": "http://localhost:16686", "type": "link" },
+    { "title": "Prometheus", "url": "http://localhost:9090", "type": "link" }
+  ],
+  "panels": [
+    {
+      "title": "🔥 API Health — Golden Signals",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total[1m])) by (service)", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" } }
+      }
+    },
+    {
+      "title": "Error Rate (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{status=~\"5..\"}[1m])) by (service) / sum(rate(http_requests_total[1m])) by (service) * 100", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "max": 100, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 5, "color": "yellow" }, { "value": 20, "color": "red" }] } }
+      }
+    },
+    {
+      "title": "Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 0.5, "color": "yellow" }, { "value": 2, "color": "red" }] } }
+      }
+    },
+
+    {
+      "title": "🛡️ Service Health — Circuit Breakers",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+    {
+      "title": "Circuit Breaker State",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "targets": [
+        { "expr": "hotsot_circuit_breaker_state", "legendFormat": "{{service}}/{{resource}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "CLOSED", "color": "green" }, "1": { "text": "HALF_OPEN", "color": "yellow" }, "2": { "text": "OPEN", "color": "red" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "CPU Usage per Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "targets": [
+        { "expr": "process_cpu_seconds_total", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "title": "Memory Usage per Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "targets": [
+        { "expr": "process_resident_memory_bytes", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+
+    {
+      "title": "📡 Event System — Kafka",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "collapsed": false
+    },
+    {
+      "title": "Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
+      "targets": [
+        { "expr": "kafka_consumer_group_lag", "legendFormat": "{{group}}" }
+      ],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 500, "color": "yellow" }, { "value": 5000, "color": "red" }] } } }
+    },
+    {
+      "title": "Events Published / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "targets": [
+        { "expr": "sum(rate(hotsot_events_published_total[1m])) by (topic)", "legendFormat": "{{topic}}" }
+      ]
+    },
+    {
+      "title": "DLQ Messages",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "targets": [
+        { "expr": "sum(rate(kafka_topic_partition_current_offset{topic=~\"hotsot.dlq.*\"}[5m])) by (topic)", "legendFormat": "{{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 1, "color": "red" }] } } }
+    },
+
+    {
+      "title": "🗄️ Database Health",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "collapsed": false
+    },
+    {
+      "title": "Query Duration",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "pg_stat_statements_mean_exec_time", "legendFormat": "{{datname}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "title": "Connection Pool Usage",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+      "targets": [
+        { "expr": "pg_stat_activity_count / pg_settings_max_connections * 100" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "max": 100, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 70, "color": "yellow" }, { "value": 90, "color": "red" }] } }
+      }
+    },
+    {
+      "title": "Redis Memory",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "targets": [
+        { "expr": "redis_memory_used_bytes / redis_memory_max_bytes * 100" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "max": 100, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 75, "color": "yellow" }, { "value": 90, "color": "red" }] } }
+      }
+    },
+
+    {
+      "title": "💣 Chaos Impact — Before vs After",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "collapsed": false
+    },
+    {
+      "title": "Service Recovery Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "targets": [
+        { "expr": "hotsot_service_recovery_seconds", "legendFormat": "{{service}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 30, "color": "red" }] } } }
+    },
+    {
+      "title": "Chaos Experiment Timeline",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "targets": [
+        { "expr": "hotsot_chaos_experiment_active", "legendFormat": "{{experiment}} → {{target}}" }
+      ],
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "INACTIVE" }, "1": { "text": "ACTIVE", "color": "red" } } }] } }
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["hotsot", "chaos-engineering"],
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "type": "query",
+        "query": "label_values(http_requests_total, service)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "title": "HotSot Chaos Engineering",
+  "uid": "hotsot-chaos",
+  "version": 1
+}

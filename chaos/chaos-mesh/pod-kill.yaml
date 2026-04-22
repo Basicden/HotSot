@@ -1,0 +1,32 @@
+# HotSot Chaos — Pod Kill (Service Crash Simulation)
+#
+# What: Randomly kills one service pod
+# Tests: Auto-recovery, health check, Kubernetes rescheduling
+# Hypothesis: "Service recovers within 30 seconds via K8s restart"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/pod-kill.yaml
+#
+# Monitor:
+#   kubectl get pods -w
+#   Check Grafana: service recovery time
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: hotsot-pod-kill
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: pod-kill
+spec:
+  action: pod-kill
+  mode: one
+  duration: "30s"
+  selector:
+    labelSelectors:
+      app.kubernetes.io/part-of: hotsot
+    namespaces:
+      - hotsot
+  scheduler:
+    cron: "@every 5m"

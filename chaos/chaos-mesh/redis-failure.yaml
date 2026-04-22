@@ -1,0 +1,32 @@
+# HotSot Chaos — Redis Failure (Cache + Lock Outage)
+#
+# What: Kills Redis pod
+# Tests: Circuit breaker on Redis, distributed lock handling, cache miss storm
+# Hypothesis: "Circuit breaker opens, services continue with DB fallback"
+#
+# Apply:
+#   kubectl apply -f chaos/chaos-mesh/redis-failure.yaml
+#
+# Expected behavior:
+#   - RedisClient circuit breaker opens after 3 failures
+#   - Services fall back to direct DB queries (higher latency, not crash)
+#   - Distributed locks become unavailable (fail-closed: reject operations)
+#   - On Redis recovery, circuit breaker transitions to HALF_OPEN, then CLOSED
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: hotsot-redis-failure
+  namespace: hotsot
+  labels:
+    chaos-mesh: hotsot
+    experiment: redis-failure
+spec:
+  action: pod-kill
+  mode: one
+  duration: "60s"
+  selector:
+    labelSelectors:
+      app: redis
+    namespaces:
+      - hotsot

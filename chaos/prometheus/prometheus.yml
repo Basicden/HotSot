@@ -1,0 +1,79 @@
+# HotSot — Prometheus Configuration
+#
+# Collects metrics from all 18 microservices + infrastructure.
+# Scrapes FastAPI /metrics endpoints exposed by each service.
+#
+# Usage:
+#   docker-compose up prometheus
+#   UI: http://localhost:9090
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'hotsot'
+    environment: 'development'
+
+# ─── Alert Rules ─────────────────────────────────────────────
+rule_files:
+  - 'alerts/*.yml'
+
+# ─── Scrape Targets ─────────────────────────────────────────
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ─── Infrastructure ─────────────────────────────────────
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    scrape_interval: 30s
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 30s
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+    scrape_interval: 30s
+
+  - job_name: 'elasticsearch'
+    static_configs:
+      - targets: ['es-exporter:9114']
+    scrape_interval: 30s
+
+  # ─── HotSot Services (18 microservices) ────────────────
+  - job_name: 'hotsot-services'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - 'api-gateway:8000'
+          - 'order-service:8001'
+          - 'kitchen-service:8002'
+          - 'shelf-service:8003'
+          - 'eta-service:8004'
+          - 'notification-service:8005'
+          - 'realtime-service:8006'
+          - 'ml-service:8007'
+          - 'arrival-service:8008'
+          - 'compensation-service:8009'
+          - 'vendor-service:8010'
+          - 'menu-service:8011'
+          - 'search-service:8012'
+          - 'pricing-service:8013'
+          - 'compliance-service:8014'
+          - 'billing-service:8015'
+          - 'analytics-service:8016'
+          - 'config-service:8017'
+        labels:
+          cluster: 'hotsot'
+
+  # ─── k6 Load Test Metrics ──────────────────────────────
+  - job_name: 'k6'
+    static_configs:
+      - targets: ['k6:6565']
