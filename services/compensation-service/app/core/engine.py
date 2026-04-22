@@ -40,11 +40,23 @@ class CompensationEngine:
         self._kafka = kafka_producer
 
     def calculate_compensation(self, reason: str, order_amount: Union[Decimal, str, float],
-                                tenant_id: str = None) -> Dict[str, Any]:
+                                tenant_id: str = None,
+                                existing_compensation: Union[Decimal, str, float, None] = None) -> Dict[str, Any]:
         """Calculate compensation amount based on reason and order amount.
 
         Uses Decimal for all monetary arithmetic to prevent rounding errors.
         Float input is converted via string to preserve intent.
+
+        FIX #8: Applied aggregate cap — total compensation never exceeds
+        min(order_amount, MAX_COMPENSATION_AMOUNT). If existing_compensation
+        is provided (from previous penalties for the same order), the new
+        compensation is capped so that the total never exceeds the order amount.
+
+        Args:
+            reason: Compensation reason (e.g., SHELF_EXPIRED, DELAY_15MIN).
+            order_amount: The original order amount in INR.
+            tenant_id: Optional tenant for per-tenant rules.
+            existing_compensation: Sum of already-applied compensation for this order.
         """
         # Convert to Decimal — reject raw float, accept str or Decimal
         if isinstance(order_amount, float):
@@ -60,8 +72,25 @@ class CompensationEngine:
         rule = DEFAULT_RULES.get(reason, {"type": "PARTIAL_REFUND", "percentage": Decimal("10.00"), "auto_approve": False})
 
         amount = round_inr(order_amount * (rule["percentage"] / Decimal("100.00")))
-        # Cap at max (default 5000 INR)
-        amount = min(amount, MAX_COMPENSATION_AMOUNT)
+
+        # FIX #8: Aggregate cap — compensation never exceeds order_amount or MAX_COMPENSATION_AMOUNT
+        # Step 1: Absolute cap (₹5000 or order amount, whichever is less)
+        absolute_cap = min(order_amount, MAX_COMPENSATION_AMOUNT)
+
+        # Step 2: If there's existing compensation, reduce the cap further
+        if existing_compensation is not None:
+            if isinstance(existing_compensation, float):
+                existing_compensation = Decimal(str(existing_compensation))
+            elif isinstance(existing_compensation, str):
+                existing_compensation = Decimal(existing_compensation)
+
+            remaining_cap = max(Decimal("0.00"), absolute_cap - existing_compensation)
+            amount = min(amount, remaining_cap)
+        else:
+            amount = min(amount, absolute_cap)
+
+        # Step 3: Never allow negative compensation
+        amount = max(amount, Decimal("0.00"))
 
         return {
             "reason": reason,
@@ -71,6 +100,8 @@ class CompensationEngine:
             "compensation_amount": str(amount),
             "currency": "INR",
             "auto_approve": rule["auto_approve"],
+            "aggregate_cap_applied": amount < round_inr(order_amount * (rule["percentage"] / Decimal("100.00"))),
+            "absolute_cap": str(absolute_cap),
         }
 
     async def trigger_refund(self, case_id: str, order_id: str,

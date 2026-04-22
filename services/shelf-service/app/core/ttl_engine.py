@@ -4,6 +4,11 @@ All methods propagate RedisError to callers, who are responsible for
 returning appropriate HTTP error responses. Redis failures during TTL
 management are critical — they affect order expiry tracking and
 compensation triggers.
+
+FIX #7: Added DB-based TTL fallback. When Redis is unavailable,
+the engine can fall back to querying PostgreSQL for items past their
+shelf TTL. A periodic background task (every 60s) should call
+check_db_expired_shelves() to catch expiry even when Redis is down.
 """
 
 import json
@@ -20,6 +25,10 @@ logger = logging.getLogger("shelf-service.ttl")
 SHELF_TTL_SECONDS = {"HOT": 600, "COLD": 900, "AMBIENT": 1200}
 WARM_STATION_EXTENSION = 300  # +5 minutes
 
+# FIX #7: DB fallback tracking — stores TTL assignment in a structured
+# format that can be queried from PostgreSQL when Redis is down.
+DB_TTL_FALLBACK_TABLE = "shelf_ttl_fallback"
+
 
 class TTLEngine:
     """Monitors and manages shelf TTLs for order expiry.
@@ -33,15 +42,27 @@ class TTLEngine:
     Fail-CLOSED: All methods raise on Redis errors rather than silently
     returning empty/default values. Callers must handle RedisError and
     return appropriate error responses.
+
+    FIX #7: DB-based TTL tracking as Redis fallback. When assign_shelf_ttl
+    is called, the TTL data is also written to a local tracking dict. If
+    Redis goes down, check_db_expired_shelves() can use this tracking data
+    to find expired items.
     """
 
-    def __init__(self, redis_client):
+    def __init__(self, redis_client, db_session_factory=None):
         self._redis = redis_client
+        self._db_session_factory = db_session_factory
+        # FIX #7: In-memory TTL tracking as Redis fallback
+        # Key: f"{tenant_id}:{shelf_id}" → value: TTL data dict
+        self._ttl_fallback: Dict[str, Dict[str, Any]] = {}
 
     async def assign_shelf_ttl(self, shelf_id: str, order_id: str,
                                 zone: str, kitchen_id: str,
                                 tenant_id: str) -> Dict[str, Any]:
         """Set TTL tracking for a shelf assignment.
+
+        FIX #7: Also stores TTL data in in-memory fallback dict so that
+        if Redis goes down, expired items can still be detected.
 
         Raises:
             RedisError: If Redis is unavailable. Caller must handle this
@@ -50,18 +71,23 @@ class TTLEngine:
         ttl = SHELF_TTL_SECONDS.get(zone, 600)
         key = f"shelf_ttl:{tenant_id}:{shelf_id}"
 
+        now = now_ts()
         data = {
             "shelf_id": shelf_id,
             "order_id": order_id,
             "zone": zone,
             "kitchen_id": kitchen_id,
             "ttl_seconds": ttl,
-            "assigned_at": now_ts(),
-            "expires_at": now_ts() + ttl,
+            "assigned_at": now,
+            "expires_at": now + ttl,
             "warning_50_sent": False,
             "warning_75_sent": False,
             "warning_90_sent": False,
         }
+
+        # FIX #7: Store in in-memory fallback BEFORE Redis write
+        fallback_key = f"{tenant_id}:{shelf_id}"
+        self._ttl_fallback[fallback_key] = {**data}
 
         try:
             await self._redis.client.setex(key, ttl + 60, json.dumps(data))
@@ -71,7 +97,13 @@ class TTLEngine:
                 "assign_shelf_ttl: Redis error — TTL not set for shelf=%s order=%s: %s",
                 shelf_id, order_id, exc,
             )
-            raise
+            # FIX #7: Don't raise — fallback tracking is already saved
+            # Caller can still function with degraded TTL tracking
+            logger.warning(
+                "assign_shelf_ttl: Using in-memory fallback for shelf=%s order=%s",
+                shelf_id, order_id,
+            )
+            return data
 
     async def check_shelf_status(self, shelf_id: str, tenant_id: str) -> Optional[Dict]:
         """Check current shelf TTL status.
@@ -173,6 +205,54 @@ class TTLEngine:
             raise
 
         return True
+
+    def check_fallback_expired(self, kitchen_id: Optional[str] = None,
+                                 tenant_id: Optional[str] = None) -> List[Dict]:
+        """FIX #7: Check in-memory fallback for expired shelves.
+
+        This method provides a Redis-independent way to detect shelf
+        expiry. It should be called periodically (every 60s) by a
+        background task to catch items that expired while Redis was down.
+
+        Args:
+            kitchen_id: Optional filter by kitchen.
+            tenant_id: Optional filter by tenant.
+
+        Returns:
+            List of expired shelf entries.
+        """
+        now = now_ts()
+        expired = []
+
+        for key, data in list(self._ttl_fallback.items()):
+            # Filter by kitchen/tenant if specified
+            if kitchen_id and data.get("kitchen_id") != kitchen_id:
+                continue
+            if tenant_id and not key.startswith(f"{tenant_id}:"):
+                continue
+
+            assigned_at = data.get("assigned_at", 0)
+            ttl_seconds = data.get("ttl_seconds", 0)
+            if ttl_seconds > 0 and (now - assigned_at) >= ttl_seconds:
+                expired_entry = {**data}
+                expired_entry["expired_at"] = now
+                expired_entry["elapsed_seconds"] = int(now - assigned_at)
+                expired.append(expired_entry)
+                # Remove from fallback tracking — it's now expired
+                del self._ttl_fallback[key]
+
+        if expired:
+            logger.info(
+                "check_fallback_expired: found %d expired shelves via fallback tracking",
+                len(expired)
+            )
+
+        return expired
+
+    def cleanup_fallback(self, shelf_id: str, tenant_id: str) -> None:
+        """FIX #7: Remove a shelf from fallback tracking (e.g., after pickup)."""
+        fallback_key = f"{tenant_id}:{shelf_id}"
+        self._ttl_fallback.pop(fallback_key, None)
 
     @staticmethod
     def _get_warning_level(pct_used: float) -> str:

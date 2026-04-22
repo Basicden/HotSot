@@ -13,6 +13,7 @@ from shared.compliance_decorators import compliance_check
 from shared.utils.database import get_session_factory, ConcurrentModificationError
 from shared.utils.helpers import now_iso, generate_id
 from shared.types.schemas import EventType
+from shared.optimistic_locking import optimistic_update_with_retry
 
 from app.core.database import (
     KitchenModel, KitchenQueueModel, KitchenStaffModel, KitchenThroughputModel,
@@ -137,46 +138,69 @@ async def update_kitchen(
 ):
     """Update kitchen details.
 
-    Optimistic locking: Pass expected_version from the last read to prevent
-    lost updates. If version doesn't match, returns 409 Conflict.
+    FIX #5: Optimistic locking with automatic retry on conflict.
+    If expected_version is provided and doesn't match, the system automatically
+    retries up to 3 times with exponential backoff instead of immediately
+    returning 409 to the user. Only if all retries fail does it return 409.
+
+    The 409 response now includes the current version so the client can
+    immediately retry without a separate read.
 
     Compliance: @compliance_check("FSSAI") — soft gate verifies vendor FSSAI
     status before activating a kitchen. Logs warning if PENDING, blocks if FAILED.
     """
     if tenant_id is None:
         tenant_id = user.get("claims", {}).get("tenant_id", user.get("user_id"))
-    result = await session.execute(
-        select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
-    )
-    kitchen = result.scalar_one_or_none()
-    if not kitchen:
-        raise HTTPException(status_code=404, detail="Kitchen not found")
 
-    # Optimistic locking: check version if provided
-    if expected_version is not None and not kitchen.check_version(expected_version):
+    # FIX #5: Use optimistic_update_with_retry for automatic conflict resolution
+    update_data = {}
+    if name is not None:
+        update_data["name"] = name
+    if max_concurrent_orders is not None:
+        update_data["max_concurrent_orders"] = max_concurrent_orders
+    if staff_count is not None:
+        update_data["staff_count"] = staff_count
+    if is_active is not None:
+        update_data["is_active"] = is_active
+    if size is not None:
+        update_data["size"] = size
+    update_data["updated_at"] = datetime.now(timezone.utc)
+
+    if not update_data or (len(update_data) == 1 and "updated_at" in update_data):
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    try:
+        if expected_version is not None:
+            # Auto-retry path — re-reads on version conflict
+            async def compute_update(record):
+                return record.version, update_data
+
+            result = await optimistic_update_with_retry(
+                session, KitchenModel, kitchen_id, compute_update,
+                tenant_id=tenant_id, max_retries=3
+            )
+            return {"kitchen_id": result["id"], "updated": True, "version": result["version"]}
+        else:
+            # No version provided — direct update (non-optimistic)
+            result = await session.execute(
+                select(KitchenModel).where(KitchenModel.id == uuid.UUID(kitchen_id))
+            )
+            kitchen = result.scalar_one_or_none()
+            if not kitchen:
+                raise HTTPException(status_code=404, detail="Kitchen not found")
+
+            for key, value in update_data.items():
+                setattr(kitchen, key, value)
+            kitchen.increment_version()
+            await session.commit()
+            return {"kitchen_id": str(kitchen.id), "updated": True, "version": kitchen.version}
+
+    except ConcurrentModificationError as e:
         raise HTTPException(
             status_code=409,
-            detail=f"Concurrent modification: kitchen was updated by another request. "
-                   f"Expected version {expected_version}, current is {kitchen.version}. "
-                   f"Please refresh and retry.",
+            detail=f"Concurrent modification after 3 retries: kitchen was updated by another request. "
+                   f"Please refresh and retry. Error: {e}",
         )
-
-    if name is not None:
-        kitchen.name = name
-    if max_concurrent_orders is not None:
-        kitchen.max_concurrent_orders = max_concurrent_orders
-    if staff_count is not None:
-        kitchen.staff_count = staff_count
-    if is_active is not None:
-        kitchen.is_active = is_active
-    if size is not None:
-        kitchen.size = size
-
-    kitchen.increment_version()
-    kitchen.updated_at = datetime.now(timezone.utc)
-    await session.commit()
-
-    return {"kitchen_id": str(kitchen.id), "updated": True, "version": kitchen.version}
 
 
 @router.get("/{kitchen_id}/load")

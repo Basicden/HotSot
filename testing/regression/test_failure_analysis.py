@@ -22,6 +22,7 @@ Usage:
 
 import json
 import os
+import random
 import sys
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -117,6 +118,7 @@ KNOWN_FAILURES: List[FailureReport] = [
         reproduction_steps=[
             "1. Send order with kitchen_id = \"; DROP TABLE orders;--\"",
             "2. If input is concatenated into SQL query, table is dropped",
+            "3. Verify request is rejected with 400 before reaching DB layer",
         ],
         expected_behavior="Input is sanitized, request is rejected with 400",
         actual_behavior="Raw input reaches database layer",

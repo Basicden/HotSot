@@ -17,10 +17,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import uuid
 from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.jwt import get_current_user, require_role
@@ -30,6 +32,9 @@ from shared.payment_gateway import RazorpayGateway, PaymentState, PaymentGateway
 from shared.utils.config import get_settings
 from shared.utils.database import get_session_factory, set_tenant_id
 from shared.utils.helpers import generate_id, now_iso
+
+from app.core.database import OrderModel, OrderEventModel
+from app.core.state_machine import state_machine, InvalidTransitionError
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +236,16 @@ async def confirm_payment(
     }
 
 
+async def _get_redis_client(request: Request):
+    """Get Redis client from app state."""
+    return getattr(request.app.state, 'redis_client', None)
+
+
+async def _get_kafka_producer(request: Request):
+    """Get Kafka producer from app state."""
+    return getattr(request.app.state, 'kafka_producer', None)
+
+
 @router.post("/webhook")
 async def razorpay_webhook(request: Request):
     """
@@ -242,6 +257,12 @@ async def razorpay_webhook(request: Request):
         - payment.failed
         - refund.processed
 
+    CRITICAL SAFETY:
+    1. Webhook secret MUST be configured — rejects all webhooks without it (fail-closed)
+    2. Redis-based idempotency prevents double-processing of duplicate webhooks
+    3. State machine validation prevents invalid order state transitions
+    4. Late payment confirmations on CANCELLED orders trigger auto-refund
+
     IMPORTANT: This endpoint does NOT require JWT auth.
     Razorpay signs webhooks with a shared secret instead.
     """
@@ -251,18 +272,28 @@ async def razorpay_webhook(request: Request):
     settings = get_settings("order")
     webhook_signature = request.headers.get("X-Razorpay-Signature", "")
 
+    # FIX #1: Fail-CLOSED — webhook secret MUST be configured
+    if not settings.RAZORPAY_WEBHOOK_SECRET:
+        logger.critical(
+            "Webhook rejected: RAZORPAY_WEBHOOK_SECRET not configured. "
+            "All webhooks are rejected until the secret is set."
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing disabled: secret not configured."
+        )
+
     # Verify webhook signature using shared gateway
     if not _gateway.verify_webhook_signature(body.decode("utf-8"), webhook_signature):
-        if settings.RAZORPAY_WEBHOOK_SECRET:
-            logger.warning("Webhook signature verification FAILED")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        # If no webhook secret configured, log warning but proceed
-        logger.warning("Webhook secret not configured — skipping signature verification")
+        logger.warning("Webhook signature verification FAILED")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     event = body_json.get("event", "")
     payload = body_json.get("payload", {})
 
     logger.info(f"Razorpay webhook received: event={event}")
+
+    redis_client = await _get_redis_client(request)
 
     if event == "payment.captured":
         payment_entity = payload.get("payment", {}).get("entity", {})
@@ -270,10 +301,137 @@ async def razorpay_webhook(request: Request):
         order_id = payment_entity.get("notes", {}).get("order_id")
         amount_paise = payment_entity.get("amount", 0)
         amount = Money.from_paise(amount_paise)
+
+        # FIX #1: Redis-based idempotency — prevent double capture
+        idempotency_key = f"webhook:captured:{payment_id}"
+        if redis_client:
+            already_processed = await redis_client.cache_get(
+                idempotency_key, prefix="idempotency"
+            )
+            if already_processed:
+                logger.info(
+                    f"Webhook already processed (idempotent): payment={payment_id} "
+                    f"order={order_id} — returning 200 OK"
+                )
+                return {"status": "already_processed", "payment_id": payment_id}
+            # Mark as processed with 24h TTL
+            await redis_client.cache_set(
+                idempotency_key, {"status": "captured", "order_id": order_id},
+                ttl=86400, prefix="idempotency"
+            )
+
         logger.info(
             f"Webhook: payment captured — payment={payment_id} "
             f"order={order_id} amount={amount}"
         )
+
+        # FIX #2: Actually update order state in DB + enforce state machine
+        if order_id:
+            session_factory = get_session_factory("order")
+            async with session_factory() as session:
+                try:
+                    tenant_id = payment_entity.get("notes", {}).get("tenant_id", "default")
+                    await set_tenant_id(session, tenant_id)
+
+                    result = await session.execute(
+                        select(OrderModel).where(
+                            OrderModel.id == uuid.UUID(order_id),
+                        )
+                    )
+                    order = result.scalar_one_or_none()
+
+                    if order:
+                        current_state = order.status
+
+                        # FIX #2: State machine validation before transition
+                        target_state = "PAYMENT_CONFIRMED"
+                        valid_next = {
+                            "PAYMENT_PENDING": "PAYMENT_CONFIRMED",
+                        }
+
+                        if current_state in ("PICKED", "EXPIRED", "REFUNDED", "CANCELLED", "FAILED"):
+                            # Late payment on terminal state — trigger refund
+                            logger.warning(
+                                f"Late payment confirmation on terminal state: "
+                                f"order={order_id} state={current_state} — triggering refund"
+                            )
+                            # Auto-refund via compensation service (event-driven)
+                            producer = await _get_kafka_producer(request)
+                            if producer:
+                                await producer.publish_raw(
+                                    topic="hotsot.compensation.events.v1",
+                                    key=order_id,
+                                    value={
+                                        "event_id": generate_id(),
+                                        "event_type": "COMPENSATION_TRIGGERED",
+                                        "order_id": order_id,
+                                        "tenant_id": tenant_id,
+                                        "source": "order-service-webhook",
+                                        "timestamp": now_iso(),
+                                        "schema_version": 2,
+                                        "payload": {
+                                            "reason": "LATE_PAYMENT_ON_CANCELLED",
+                                            "payment_id": payment_id,
+                                            "amount_paise": amount_paise,
+                                            "original_state": current_state,
+                                            "auto_refund": True,
+                                        },
+                                    },
+                                )
+                            await session.commit()
+                            return {
+                                "status": "refund_initiated",
+                                "reason": f"Order in {current_state} — late payment auto-refunded",
+                            }
+
+                        if current_state in valid_next:
+                            try:
+                                new_status = state_machine.transition(current_state, target_state)
+                                order.status = new_status
+                                order.payment_ref = payment_id
+
+                                # Persist event
+                                event_record = OrderEventModel(
+                                    id=uuid.uuid4(),
+                                    tenant_id=tenant_id,
+                                    order_id=uuid.UUID(order_id),
+                                    event_type="PAYMENT_CONFIRMED",
+                                    payload={
+                                        "payment_ref": payment_id,
+                                        "amount": str(amount),
+                                        "source": "webhook",
+                                    },
+                                    source="order-service-webhook",
+                                    idempotency_key=idempotency_key,
+                                )
+                                session.add(event_record)
+                                await session.commit()
+
+                                # Update Redis hot state
+                                if redis_client:
+                                    await redis_client.set_order_status(
+                                        order_id, new_status, tenant_id
+                                    )
+
+                                logger.info(
+                                    f"Webhook: order state updated — order={order_id} "
+                                    f"{current_state} → {new_status}"
+                                )
+                            except InvalidTransitionError as e:
+                                logger.warning(
+                                    f"Webhook: invalid state transition for order={order_id}: {e}"
+                                )
+                                await session.rollback()
+                        else:
+                            logger.info(
+                                f"Webhook: order={order_id} already in state={current_state} "
+                                f"(expected PAYMENT_PENDING) — idempotent"
+                            )
+                    else:
+                        logger.warning(f"Webhook: order={order_id} not found in DB")
+                except Exception as e:
+                    logger.error(f"Webhook DB update failed for order={order_id}: {e}")
+                    await session.rollback()
 
     elif event == "payment.failed":
         payment_entity = payload.get("payment", {}).get("entity", {})

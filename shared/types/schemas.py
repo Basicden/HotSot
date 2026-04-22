@@ -10,12 +10,75 @@ All models include tenant_id for multi-tenancy support.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from enum import Enum
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from datetime import datetime, timezone
 import uuid
+
+
+# ═══════════════════════════════════════════════════════════════
+# INPUT VALIDATION PATTERNS (FIX #3: SQL Injection Prevention)
+# ═══════════════════════════════════════════════════════════════
+
+# UUID format: 8-4-4-4-12 hex chars
+UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+# Safe identifier: alphanumeric, underscores, hyphens, dots only
+SAFE_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_\-.]+$')
+
+# SQL injection detection pattern
+SQL_INJECTION_PATTERN = re.compile(
+    r'(?:;|\b(?:DROP|DELETE|INSERT|UPDATE|SELECT|UNION|ALTER|CREATE|EXEC|EXECUTE|TRUNCATE)\b|'
+    r'--|/\*|\*/|xp_|0x|CHAR\(|CONCAT\(|GROUP_CONCAT|'
+    r'\.\.|\\x)',
+    re.IGNORECASE
+)
+
+# XSS detection pattern
+XSS_PATTERN = re.compile(
+    r'(?:<script|javascript:|on\w+\s*=|data:|vbscript:|'
+    r'eval\(|expression\(|alert\(|document\.)',
+    re.IGNORECASE
+)
+
+
+def validate_uuid_field(value: str, field_name: str = "id") -> str:
+    """Validate that a field contains a valid UUID format."""
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if not UUID_PATTERN.match(value):
+        raise ValueError(
+            f"{field_name} must be a valid UUID format "
+            f"(got: {value[:20]}{'...' if len(value) > 20 else ''})"
+        )
+    return value
+
+
+def validate_safe_identifier(value: str, field_name: str = "id") -> str:
+    """Validate that a field contains only safe characters (no SQL/XSS)."""
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(value) > 256:
+        raise ValueError(f"{field_name} exceeds maximum length of 256 characters")
+    if SQL_INJECTION_PATTERN.search(value):
+        raise ValueError(f"{field_name} contains potentially dangerous SQL patterns")
+    if XSS_PATTERN.search(value):
+        raise ValueError(f"{field_name} contains potentially dangerous XSS patterns")
+    return value
+
+
+def validate_no_injection(value: str, field_name: str = "field") -> str:
+    """Validate that a string field contains no SQL injection or XSS patterns."""
+    if SQL_INJECTION_PATTERN.search(value):
+        raise ValueError(f"{field_name} contains potentially dangerous SQL patterns")
+    if XSS_PATTERN.search(value):
+        raise ValueError(f"{field_name} contains potentially dangerous XSS patterns")
+    if len(value) > 4096:
+        raise ValueError(f"{field_name} exceeds maximum length of 4096 characters")
+    return value
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -235,6 +298,39 @@ class OrderCreateRequest(BaseModel):
     requested_time: Optional[str] = None
     idempotency_key: Optional[str] = None
 
+    # FIX #3: Input validation to prevent SQL injection and XSS
+    @field_validator('user_id', 'kitchen_id')
+    @classmethod
+    def validate_uuid_fields(cls, v: str) -> str:
+        return validate_uuid_field(v)
+
+    @field_validator('tenant_id', 'idempotency_key')
+    @classmethod
+    def validate_safe_fields(cls, v: str) -> str:
+        return validate_safe_identifier(v, cls.__name__)
+
+    @field_validator('payment_method')
+    @classmethod
+    def validate_payment_method(cls, v: str) -> str:
+        allowed = {"UPI", "CARD", "WALLET", "COD", "NETBANKING"}
+        if v.upper() not in allowed:
+            raise ValueError(f"payment_method must be one of {allowed}")
+        return v.upper()
+
+    @field_validator('items')
+    @classmethod
+    def validate_items(cls, v: List[Dict]) -> List[Dict]:
+        if len(v) > 50:
+            raise ValueError("Maximum 50 items per order")
+        for item in v:
+            item_id = item.get("item_id", "")
+            if isinstance(item_id, str) and (SQL_INJECTION_PATTERN.search(item_id) or XSS_PATTERN.search(item_id)):
+                raise ValueError("item_id contains invalid characters")
+            qty = item.get("qty", 0)
+            if not isinstance(qty, int) or qty < 1 or qty > 100:
+                raise ValueError(f"qty must be an integer between 1 and 100, got {qty}")
+        return v
+
 
 class PaymentInitRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -255,6 +351,14 @@ class PaymentConfirmRequest(BaseModel):
     gateway_txn_id: Optional[str] = None
     idempotency_key: Optional[str] = None
 
+    # FIX #3: Input validation
+    @field_validator('payment_ref', 'gateway_txn_id', 'idempotency_key')
+    @classmethod
+    def validate_safe_fields(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return validate_safe_identifier(v, cls.__name__)
+
 
 class ArrivalRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -267,6 +371,26 @@ class ArrivalRequest(BaseModel):
     qr_scan: bool = False
     idempotency_key: Optional[str] = None
 
+    # FIX #3: Input validation
+    @field_validator('order_id', 'user_id')
+    @classmethod
+    def validate_uuid_fields(cls, v: str) -> str:
+        return validate_uuid_field(v)
+
+    @field_validator('latitude')
+    @classmethod
+    def validate_latitude(cls, v: float) -> float:
+        if not -90 <= v <= 90:
+            raise ValueError("latitude must be between -90 and 90")
+        return v
+
+    @field_validator('longitude')
+    @classmethod
+    def validate_longitude(cls, v: float) -> float:
+        if not -180 <= v <= 180:
+            raise ValueError("longitude must be between -180 and 180")
+        return v
+
 
 class HandoffConfirmRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -277,6 +401,20 @@ class HandoffConfirmRequest(BaseModel):
     confirmation_method: str = "QR_SCAN"  # QR_SCAN, MANUAL_ACK
     idempotency_key: Optional[str] = None
 
+    # FIX #3: Input validation
+    @field_validator('order_id', 'staff_id')
+    @classmethod
+    def validate_uuid_fields(cls, v: str) -> str:
+        return validate_uuid_field(v)
+
+    @field_validator('confirmation_method')
+    @classmethod
+    def validate_confirmation_method(cls, v: str) -> str:
+        allowed = {"QR_SCAN", "MANUAL_ACK"}
+        if v not in allowed:
+            raise ValueError(f"confirmation_method must be one of {allowed}")
+        return v
+
 
 class CancelRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -285,6 +423,19 @@ class CancelRequest(BaseModel):
     tenant_id: str = Field(default="default")
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
+
+    # FIX #3: Input validation
+    @field_validator('order_id')
+    @classmethod
+    def validate_uuid_fields(cls, v: str) -> str:
+        return validate_uuid_field(v)
+
+    @field_validator('reason')
+    @classmethod
+    def validate_reason(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return validate_no_injection(v, 'reason')
 
 
 class OrderResponse(BaseModel):

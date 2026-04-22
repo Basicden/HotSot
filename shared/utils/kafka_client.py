@@ -338,16 +338,139 @@ class KafkaProducer:
 
     @staticmethod
     def _log_to_fallback(topic: str, event: EventEnvelope, error: str) -> None:
-        """Write failed events to fallback log file."""
+        """Write failed events to fallback log file with full event data for replay.
+
+        FIX #4: Enhanced fallback logging — stores the complete serialized event
+        so that KafkaRecoveryService can read and replay it when Kafka recovers.
+        Each entry is a single-line JSON object for safe parsing.
+        """
         try:
+            fallback_entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "topic": topic,
+                "error": error,
+                "event_id": event.event_id,
+                "event_type": event.event_type.value,
+                "order_id": event.order_id,
+                "tenant_id": event.tenant_id,
+                "event_data": event.model_dump(mode="json"),
+                "replay_count": 0,
+            }
             with open("/tmp/hotsot_kafka_fallback.log", "a") as f:
-                f.write(
-                    f"{datetime.now(timezone.utc).isoformat()} | "
-                    f"topic={topic} | error={error} | "
-                    f"event_id={event.event_id} type={event.event_type.value}\n"
-                )
+                f.write(json.dumps(fallback_entry, default=str) + "\n")
         except Exception as e:
-            logger.warning(f"Error during shutdown: {e}")
+            logger.warning(f"Fallback log write failed: {e}")
+
+
+class KafkaRecoveryService:
+    """Replays fallback-logged events when Kafka recovers.
+
+    FIX #4: Reads events from /tmp/hotsot_kafka_fallback.log that were
+    logged when Kafka was down, and replays them to their target topics.
+
+    Usage:
+        recovery = KafkaRecoveryService(producer)
+        replayed = await recovery.replay_fallback_log()
+    """
+
+    MAX_REPLAY_ATTEMPTS = 3
+    FALLBACK_LOG_PATH = "/tmp/hotsot_kafka_fallback.log"
+
+    def __init__(self, producer: Optional[KafkaProducer] = None):
+        self._producer = producer
+        self._replay_log_path = "/tmp/hotsot_kafka_replay_audit.log"
+
+    async def replay_fallback_log(self) -> Dict[str, Any]:
+        """Read fallback log and replay all events to Kafka.
+
+        Returns summary of replay results.
+        """
+        import os
+
+        if not os.path.exists(self.FALLBACK_LOG_PATH):
+            return {"status": "no_fallback_log", "replayed": 0, "failed": 0}
+
+        if not self._producer or not self._producer._started:
+            logger.warning("KafkaRecoveryService: producer not available — cannot replay")
+            return {"status": "producer_unavailable", "replayed": 0, "failed": 0}
+
+        replayed = 0
+        failed = 0
+        remaining_entries = []
+
+        with open(self.FALLBACK_LOG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    replay_count = entry.get("replay_count", 0)
+
+                    if replay_count >= self.MAX_REPLAY_ATTEMPTS:
+                        logger.warning(
+                            f"KafkaRecoveryService: skipping event {entry.get('event_id')} "
+                            f"after {replay_count} replay attempts"
+                        )
+                        failed += 1
+                        continue
+
+                    # Reconstruct and publish
+                    event_data = entry.get("event_data", {})
+                    topic = entry.get("topic", "hotsot.order.events.v1")
+
+                    success = await self._producer.publish_raw(
+                        topic=topic,
+                        value=event_data,
+                        key=entry.get("order_id"),
+                    )
+
+                    if success:
+                        replayed += 1
+                        logger.info(
+                            f"KafkaRecoveryService: replayed event "
+                            f"{entry.get('event_id')} type={entry.get('event_type')} "
+                            f"to topic={topic}"
+                        )
+                        # Audit log
+                        try:
+                            with open(self._replay_log_path, "a") as audit:
+                                audit.write(
+                                    f"{datetime.now(timezone.utc).isoformat()} | "
+                                    f"REPLAYED | event_id={entry.get('event_id')} "
+                                    f"topic={topic}\n"
+                                )
+                        except Exception:
+                            pass
+                    else:
+                        # Increment replay count and keep for next attempt
+                        entry["replay_count"] = replay_count + 1
+                        remaining_entries.append(line)
+                        failed += 1
+
+                except json.JSONDecodeError:
+                    # Try legacy format (pipe-delimited)
+                    logger.warning(f"KafkaRecoveryService: skipping malformed line")
+                    failed += 1
+                except Exception as e:
+                    logger.warning(f"KafkaRecoveryService: error replaying event: {e}")
+                    remaining_entries.append(line)
+                    failed += 1
+
+        # Write back remaining (unreplayed) entries
+        try:
+            with open(self.FALLBACK_LOG_PATH, "w") as f:
+                for entry_line in remaining_entries:
+                    f.write(entry_line + "\n")
+        except Exception as e:
+            logger.error(f"KafkaRecoveryService: failed to write remaining entries: {e}")
+
+        return {
+            "status": "completed",
+            "replayed": replayed,
+            "failed": failed,
+            "remaining": len(remaining_entries),
+        }
 
 
 class KafkaConsumerManager:
